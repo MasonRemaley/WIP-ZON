@@ -28,8 +28,7 @@ pub fn parse(allocator: Allocator, comptime T: type, source: [:0]const u8) !T {
     const root = data[0].lhs;
 
     return switch (@typeInfo(T)) {
-        .Int => parser.parseNumber(T, root),
-        .Float => parser.parseNumber(T, root),
+        .Int, .Float => parser.parseNumber(T, root),
         else => unreachable,
     };
 }
@@ -40,36 +39,16 @@ fn parseNumber(self: *const Parser, comptime T: type, node: NodeIndex) !T {
     const tags = self.ast.nodes.items(.tag);
     const data = self.ast.nodes.items(.data);
     return switch (tags[node]) {
-        .negation => try self.parseSignedNumber(T, data[node].lhs, .negative),
-        else => try self.parseSignedNumber(T, node, .positive),
+        .negation => try self.parseNumberWithSign(T, data[node].lhs, .negative),
+        else => try self.parseNumberWithSign(T, node, .positive),
     };
 }
 
-fn parseSignedNumber(self: *const Parser, comptime T: type, node: NodeIndex, sign: Sign) !T {
-    const main_tokens = self.ast.nodes.items(.main_token);
-    const num_lit_token = main_tokens[node];
-    const token_bytes = self.ast.tokenSlice(num_lit_token);
+fn parseNumberWithSign(self: *const Parser, comptime T: type, node: NodeIndex, sign: Sign) !T {
     const tags = self.ast.nodes.items(.tag);
     const value = switch (tags[node]) {
-        .number_literal => {
-            const number = std.zig.number_literal.parseNumberLiteral(token_bytes);
-            switch (number) {
-                .int => |int| return applySignToInt(T, sign, int),
-                .big_int => |base| return self.parseBigInt(T, sign, node, base),
-                .float => |float_base| return self.parseFloat(T, sign, node, float_base),
-                else => unreachable,
-            }
-        },
-        .char_literal => {
-            const char = std.zig.string_literal.parseCharLiteral(token_bytes);
-            return switch (char) {
-                .success => |success| switch (sign) {
-                    .positive => return std.math.cast(T, success).?,
-                    .negative => unreachable,
-                },
-                else => unreachable,
-            };
-        },
+        .number_literal => return self.parseNumberLiteral(T, node, sign),
+        .char_literal => return self.parseCharLiteral(T, node, sign),
         else => unreachable,
     };
     return .{
@@ -78,35 +57,90 @@ fn parseSignedNumber(self: *const Parser, comptime T: type, node: NodeIndex, sig
     };
 }
 
-fn applySignToInt(comptime T: type, sign: Sign, value: anytype) T {
+fn parseNumberLiteral(self: *const Parser, comptime T: type, node: NodeIndex, sign: Sign) T {
+    const main_tokens = self.ast.nodes.items(.main_token);
+    const num_lit_token = main_tokens[node];
+    const token_bytes = self.ast.tokenSlice(num_lit_token);
+    const number = std.zig.number_literal.parseNumberLiteral(token_bytes);
+    switch (number) {
+        .int => |int| return applySignToInt(T, sign, int),
+        .big_int => |base| return self.parseBigNumber(T, sign, node, base),
+        .float => |float_base| return self.parseFloat(T, sign, node, float_base),
+        else => unreachable,
+    }
+}
+
+fn applySignToInt(comptime T: type, sign: Sign, int: anytype) T {
     switch (sign) {
-        .positive => return std.math.cast(T, value).?,
-        .negative => {
-            const signed_bits = switch (@typeInfo(T)) {
-                .Int => |int_type| switch (int_type.signedness) {
-                    .signed => int_type.bits,
-                    .unsigned => unreachable,
+        .positive => switch (@typeInfo(T)) {
+            .Int => return std.math.cast(T, int).?,
+            .Float => return @intToFloat(T, int),
+            else => unreachable,
+        },
+        .negative => switch (@typeInfo(T)) {
+            .Int => |int_type| switch (int_type.signedness) {
+                .signed => {
+                    const Positive = @Type(.{ .Int = .{
+                        .bits = int_type.bits + 1,
+                        .signedness = .signed,
+                    } });
+                    const positive = std.math.cast(Positive, int).?;
+                    return std.math.cast(T, -positive).?;
                 },
-                else => unreachable,
-            };
-            const Positive = @Type(.{ .Int = .{
-                .bits = signed_bits + 1,
-                .signedness = .signed,
-            } });
-            const positive = std.math.cast(Positive, value).?;
-            return std.math.cast(T, -positive).?;
+                .unsigned => unreachable,
+            },
+            .Float => return -@intToFloat(T, int),
+            else => unreachable,
         },
     }
 }
 
-fn parseBigInt(self: *const Parser, comptime T: type, sign: Sign, node: NodeIndex, base: Base) T {
+fn parseBigNumber(
+    self: *const Parser,
+    comptime T: type,
+    sign: Sign,
+    node: NodeIndex,
+    base: Base,
+) T {
     switch (@typeInfo(T)) {
-        .Int, .ComptimeInt => {},
-        // XXX: need to implement for floats. If the formats are always compatible (base and all)
-        // then just literally pass these bytes to the float parser when we want a float.
+        .Int => return self.parseBigInt(T, sign, node, base),
+        .Float => {
+            // XXX: dup from bigint?
+            const data = self.ast.nodes.items(.data);
+            const bytes_node = switch (sign) {
+                .positive => data[node].lhs,
+                .negative => node,
+            };
+            const bytes = self.ast.tokenSlice(bytes_node);
+            const prefix_offset = @as(u8, 2) * @boolToInt(base != .decimal);
+
+            const digits = bytes.len - prefix_offset;
+
+            // XXX: there's not gonna be more than usize digits, so we could just use usize here right?
+            // but there could be less and then the power takes it to usize...
+
+            // XXX: the powi can overflow right now right?
+            // XXX: oh wait we don't know this at comptime, really we want to just take the largest
+            // possible whole f128 and use whatever size integer holds that, and set to inf or -inf
+            // if it's out of range.
+            const max_base = 16;
+            const max_unsigned = std.math.powi(usize, max_base, digits) catch unreachable;
+            const bits = std.math.log2_int_ceil(@TypeOf(max_unsigned), max_unsigned);
+            const Int = @Type(.{ .Int = .{
+                .bits = bits,
+                .signedness = switch (sign) {
+                    .positive => .unsigned,
+                    .negative => .signed,
+                },
+            } });
+            const int = self.parseBigInt(Int, sign, node, base);
+            return @intToFloat(T, int);
+        },
         else => unreachable,
     }
+}
 
+fn parseBigInt(self: *const Parser, comptime T: type, sign: Sign, node: NodeIndex, base: Base) T {
     const data = self.ast.nodes.items(.data);
     const bytes_node = switch (sign) {
         .positive => data[node].lhs,
@@ -134,7 +168,7 @@ fn parseFloat(
     node: NodeIndex,
     base: FloatBase,
 ) T {
-    const F = switch (@typeInfo(T)) {
+    const Float = switch (@typeInfo(T)) {
         .Float => T,
         .Int => f128,
         else => unreachable,
@@ -146,16 +180,29 @@ fn parseFloat(
         .negative => node,
     };
     const bytes = self.ast.tokenSlice(bytes_node);
-    const unsigned_float = std.fmt.parseFloat(F, bytes) catch unreachable;
+    std.debug.print("bytes: {s}\n", .{bytes});
+    const unsigned_float = std.fmt.parseFloat(Float, bytes) catch unreachable;
     const result = switch (sign) {
         .negative => -unsigned_float,
         .positive => unsigned_float,
     };
-    if (T == F) {
+    if (T == Float) {
         return result;
     } else {
         return floatToInt(T, result).?;
     }
+}
+
+fn parseCharLiteral(self: *const Parser, comptime T: type, node: NodeIndex, sign: Sign) T {
+    const main_tokens = self.ast.nodes.items(.main_token);
+    const num_lit_token = main_tokens[node];
+    const token_bytes = self.ast.tokenSlice(num_lit_token);
+    const char_result = std.zig.string_literal.parseCharLiteral(token_bytes);
+    const char = switch (char_result) {
+        .success => |char| char,
+        else => unreachable,
+    };
+    return applySignToInt(T, sign, char);
 }
 
 fn floatToInt(comptime T: type, value: anytype) ?T {
@@ -239,17 +286,73 @@ test "parse int" {
 
     // Test big integer limits
     try std.testing.expectEqual(
-        @as(i65, 18446744073709551615),
-        try parse(allocator, i65, "18446744073709551615"),
+        @as(i66, 36893488147419103231),
+        try parse(allocator, i66, "36893488147419103231"),
     );
     try std.testing.expectEqual(
-        @as(i65, -18446744073709551616),
-        try parse(allocator, i65, "-18446744073709551616"),
+        @as(i66, -36893488147419103232),
+        try parse(allocator, i66, "-36893488147419103232"),
     );
 
     // Test parsing whole number floats as integers
     try std.testing.expectEqual(@as(i8, -1), try parse(allocator, i8, "-1.0"));
     try std.testing.expectEqual(@as(i8, 123), try parse(allocator, i8, "123.0"));
+
+    // XXX: test bases with big integers?
+    // Test non-decimal integers
+    try std.testing.expectEqual(@as(i16, 0xff), try parse(allocator, i16, "0xff"));
+    try std.testing.expectEqual(@as(i16, -0xff), try parse(allocator, i16, "-0xff"));
+    try std.testing.expectEqual(@as(i16, 0o77), try parse(allocator, i16, "0o77"));
+    try std.testing.expectEqual(@as(i16, -0o77), try parse(allocator, i16, "-0o77"));
+    try std.testing.expectEqual(@as(i16, 0b11), try parse(allocator, i16, "0b11"));
+    try std.testing.expectEqual(@as(i16, -0b11), try parse(allocator, i16, "-0b11"));
+
+    // Test non-decimal big integers
+    try std.testing.expectEqual(@as(u65, 0x1ffffffffffffffff), try parse(
+        allocator,
+        u65,
+        "0x1ffffffffffffffff",
+    ));
+    try std.testing.expectEqual(@as(i66, 0x1ffffffffffffffff), try parse(
+        allocator,
+        i66,
+        "0x1ffffffffffffffff",
+    ));
+    try std.testing.expectEqual(@as(i66, -0x1ffffffffffffffff), try parse(
+        allocator,
+        i66,
+        "-0x1ffffffffffffffff",
+    ));
+    try std.testing.expectEqual(@as(u65, 0x1ffffffffffffffff), try parse(
+        allocator,
+        u65,
+        "0o3777777777777777777777",
+    ));
+    try std.testing.expectEqual(@as(i66, 0x1ffffffffffffffff), try parse(
+        allocator,
+        i66,
+        "0o3777777777777777777777",
+    ));
+    try std.testing.expectEqual(@as(i66, -0x1ffffffffffffffff), try parse(
+        allocator,
+        i66,
+        "-0o3777777777777777777777",
+    ));
+    try std.testing.expectEqual(@as(u65, 0x1ffffffffffffffff), try parse(
+        allocator,
+        u65,
+        "0b11111111111111111111111111111111111111111111111111111111111111111",
+    ));
+    try std.testing.expectEqual(@as(i66, 0x1ffffffffffffffff), try parse(
+        allocator,
+        i66,
+        "0b11111111111111111111111111111111111111111111111111111111111111111",
+    ));
+    try std.testing.expectEqual(@as(i66, -0x1ffffffffffffffff), try parse(
+        allocator,
+        i66,
+        "-0b11111111111111111111111111111111111111111111111111111111111111111",
+    ));
 }
 
 test "parse float" {
@@ -257,17 +360,56 @@ test "parse float" {
 
     // Test decimals
     try std.testing.expectEqual(@as(f16, 0.5), try parse(allocator, f16, "0.5"));
-    // try std.testing.expectEqual(@as(f32, 123.456), try parse(allocator, f32, "123.456"));
-    // try std.testing.expectEqual(@as(f64, -123.456), try parse(allocator, f64, "-123.456"));
-    // try std.testing.expectEqual(@as(f128, 42.5), try parse(allocator, f128, "42.5"));
+    try std.testing.expectEqual(@as(f32, 123.456), try parse(allocator, f32, "123.456"));
+    try std.testing.expectEqual(@as(f64, -123.456), try parse(allocator, f64, "-123.456"));
+    try std.testing.expectEqual(@as(f128, 42.5), try parse(allocator, f128, "42.5"));
 
-    // // Test whole numbers with and without decimals
-    // try std.testing.expectEqual(@as(f16, 5.0), try parse(allocator, f16, "5.0"));
-    // try std.testing.expectEqual(@as(f16, 5.0), try parse(allocator, f16, "5"));
-    // try std.testing.expectEqual(@as(f32, -102), try parse(allocator, f32, "-102.0"));
-    // try std.testing.expectEqual(@as(f32, -102), try parse(allocator, f32, "-102"));
+    // Test whole numbers with and without decimals
+    try std.testing.expectEqual(@as(f16, 5.0), try parse(allocator, f16, "5.0"));
+    try std.testing.expectEqual(@as(f16, 5.0), try parse(allocator, f16, "5"));
+    try std.testing.expectEqual(@as(f32, -102), try parse(allocator, f32, "-102.0"));
+    try std.testing.expectEqual(@as(f32, -102), try parse(allocator, f32, "-102"));
 
-    // // Test characters
-    // try std.testing.expectEqual(@as(f32, 'a'), try parse(allocator, u8, "'a'"));
-    // try std.testing.expectEqual(@as(f32, 'z'), try parse(allocator, f32, "'z'"));
+    // Test characters and negated characters
+    try std.testing.expectEqual(@as(f32, 'a'), try parse(allocator, f32, "'a'"));
+    try std.testing.expectEqual(@as(f32, 'z'), try parse(allocator, f32, "'z'"));
+    try std.testing.expectEqual(@as(f32, -'z'), try parse(allocator, f32, "-'z'"));
+
+    // Test big integers
+    try std.testing.expectEqual(
+        @as(f32, 36893488147419103231),
+        try parse(allocator, f32, "36893488147419103231"),
+    );
+    try std.testing.expectEqual(
+        @as(f32, -36893488147419103231),
+        try parse(allocator, f32, "-36893488147419103231"),
+    );
+    // XXX: ...
+    // std.debug.print("a: {x}\n", .{@as(f32, 0x1ffffffffffffffff)});
+    // std.debug.print("b: {x}\n", .{std.fmt.parseFloat(f32, "0x1ffffffffffffffff") catch unreachable});
+    try std.testing.expectEqual(@as(f128, 0x1ffffffffffffffff), try parse(
+        allocator,
+        f128,
+        "0x1ffffffffffffffff",
+    ));
+    comptime assert(@as(f32, 0x1ffffffffffffffff) == @intToFloat(f32, std.fmt.parseInt(u66, "1ffffffffffffffff", 16) catch unreachable));
+    // comptime assert(@as(f32, 0x1ffffffffffffffff) == std.math.inf(f32));
+    // const f: f128 = 0x1ffffffffffffffff;
+    // const fs: f32 = f;
+    // try std.testing.expectEqual(fs, try parse(
+    //     allocator,
+    //     f32,
+    //     "0x1ffffffffffffffff",
+    // ));
+
+    // Exponents, underscores
+    try std.testing.expectEqual(@as(f32, 123.0E+77), try parse(allocator, f32, "12_3.0E+77"));
+
+    // Hexadecimal
+    try std.testing.expectEqual(@as(f32, 0x103.70p-5), try parse(allocator, f32, "0x103.70p-5"));
+    try std.testing.expectEqual(@as(f32, -0x103.70), try parse(allocator, f32, "-0x103.70"));
+    try std.testing.expectEqual(
+        @as(f32, 0x1234_5678.9ABC_CDEFp-10),
+        try parse(allocator, f32, "0x1234_5678.9ABC_CDEFp-10"),
+    );
 }
