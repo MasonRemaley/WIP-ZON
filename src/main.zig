@@ -29,6 +29,7 @@ pub fn parse(allocator: Allocator, comptime T: type, source: [:0]const u8) !T {
 
     return switch (@typeInfo(T)) {
         .Int => parser.parseNumber(T, root),
+        .Float => parser.parseNumber(T, root),
         else => unreachable,
     };
 }
@@ -99,6 +100,13 @@ fn applySignToInt(comptime T: type, sign: Sign, value: anytype) T {
 }
 
 fn parseBigInt(self: *const Parser, comptime T: type, sign: Sign, node: NodeIndex, base: Base) T {
+    switch (@typeInfo(T)) {
+        .Int, .ComptimeInt => {},
+        // XXX: need to implement for floats. If the formats are always compatible (base and all)
+        // then just literally pass these bytes to the float parser when we want a float.
+        else => unreachable,
+    }
+
     const data = self.ast.nodes.items(.data);
     const bytes_node = switch (sign) {
         .positive => data[node].lhs,
@@ -202,7 +210,7 @@ test "floatToInt" {
     );
 }
 
-test "parseInt" {
+test "parse int" {
     const allocator = std.testing.allocator;
 
     // Test various numbers and types
@@ -242,4 +250,24 @@ test "parseInt" {
     // Test parsing whole number floats as integers
     try std.testing.expectEqual(@as(i8, -1), try parse(allocator, i8, "-1.0"));
     try std.testing.expectEqual(@as(i8, 123), try parse(allocator, i8, "123.0"));
+}
+
+test "parse float" {
+    const allocator = std.testing.allocator;
+
+    // Test decimals
+    try std.testing.expectEqual(@as(f16, 0.5), try parse(allocator, f16, "0.5"));
+    // try std.testing.expectEqual(@as(f32, 123.456), try parse(allocator, f32, "123.456"));
+    // try std.testing.expectEqual(@as(f64, -123.456), try parse(allocator, f64, "-123.456"));
+    // try std.testing.expectEqual(@as(f128, 42.5), try parse(allocator, f128, "42.5"));
+
+    // // Test whole numbers with and without decimals
+    // try std.testing.expectEqual(@as(f16, 5.0), try parse(allocator, f16, "5.0"));
+    // try std.testing.expectEqual(@as(f16, 5.0), try parse(allocator, f16, "5"));
+    // try std.testing.expectEqual(@as(f32, -102), try parse(allocator, f32, "-102.0"));
+    // try std.testing.expectEqual(@as(f32, -102), try parse(allocator, f32, "-102"));
+
+    // // Test characters
+    // try std.testing.expectEqual(@as(f32, 'a'), try parse(allocator, u8, "'a'"));
+    // try std.testing.expectEqual(@as(f32, 'z'), try parse(allocator, f32, "'z'"));
 }
