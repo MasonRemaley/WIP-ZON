@@ -28,9 +28,35 @@ pub fn parse(allocator: Allocator, comptime T: type, source: [:0]const u8) !T {
     const root = data[0].lhs;
 
     return switch (@typeInfo(T)) {
+        .Bool => parser.parseBool(root),
         .Int, .Float => parser.parseNumber(T, root),
         else => unreachable,
     };
+}
+
+fn parseBool(self: *const Parser, node: NodeIndex) !bool {
+    const tags = self.ast.nodes.items(.tag);
+    return switch (tags[node]) {
+        .identifier => {
+            const main_tokens = self.ast.nodes.items(.main_token);
+            const ident_token = main_tokens[node];
+            const bytes = self.ast.tokenSlice(ident_token);
+            if (std.mem.eql(u8, bytes, "true")) {
+                return true;
+            } else if (std.mem.eql(u8, bytes, "false")) {
+                return false;
+            } else {
+                unreachable;
+            }
+        },
+        else => unreachable,
+    };
+}
+
+test "parse bool" {
+    const allocator = std.testing.allocator;
+    try std.testing.expectEqual(true, try parse(allocator, bool, "true"));
+    try std.testing.expectEqual(false, try parse(allocator, bool, "false"));
 }
 
 const Sign = enum { positive, negative };
@@ -172,6 +198,7 @@ fn parseCharLiteral(self: *const Parser, comptime T: type, node: NodeIndex, sign
     return applySignToInt(T, sign, char);
 }
 
+// TODO: move to std.math?
 fn floatToInt(comptime T: type, value: anytype) ?T {
     switch (@typeInfo(@TypeOf(value))) {
         .Float, .ComptimeFloat => {},
