@@ -65,7 +65,7 @@ fn parseNumberLiteral(self: *const Parser, comptime T: type, node: NodeIndex, si
     switch (number) {
         .int => |int| return applySignToInt(T, sign, int),
         .big_int => |base| return self.parseBigNumber(T, sign, node, base),
-        .float => |float_base| return self.parseFloat(T, sign, node, float_base),
+        .float => return self.parseFloat(T, sign, node),
         else => unreachable,
     }
 }
@@ -104,38 +104,8 @@ fn parseBigNumber(
 ) T {
     switch (@typeInfo(T)) {
         .Int => return self.parseBigInt(T, sign, node, base),
-        .Float => {
-            // XXX: dup from bigint?
-            const data = self.ast.nodes.items(.data);
-            const bytes_node = switch (sign) {
-                .positive => data[node].lhs,
-                .negative => node,
-            };
-            const bytes = self.ast.tokenSlice(bytes_node);
-            const prefix_offset = @as(u8, 2) * @boolToInt(base != .decimal);
-
-            const digits = bytes.len - prefix_offset;
-
-            // XXX: there's not gonna be more than usize digits, so we could just use usize here right?
-            // but there could be less and then the power takes it to usize...
-
-            // XXX: the powi can overflow right now right?
-            // XXX: oh wait we don't know this at comptime, really we want to just take the largest
-            // possible whole f128 and use whatever size integer holds that, and set to inf or -inf
-            // if it's out of range.
-            const max_base = 16;
-            const max_unsigned = std.math.powi(usize, max_base, digits) catch unreachable;
-            const bits = std.math.log2_int_ceil(@TypeOf(max_unsigned), max_unsigned);
-            const Int = @Type(.{ .Int = .{
-                .bits = bits,
-                .signedness = switch (sign) {
-                    .positive => .unsigned,
-                    .negative => .signed,
-                },
-            } });
-            const int = self.parseBigInt(Int, sign, node, base);
-            return @intToFloat(T, int);
-        },
+        // TODO: passing in f128 to work around possible float parsing bug
+        .Float => return @floatCast(T, self.parseFloat(f128, sign, node)),
         else => unreachable,
     }
 }
@@ -166,21 +136,18 @@ fn parseFloat(
     comptime T: type,
     sign: Sign,
     node: NodeIndex,
-    base: FloatBase,
 ) T {
     const Float = switch (@typeInfo(T)) {
         .Float => T,
         .Int => f128,
         else => unreachable,
     };
-    _ = base; // XXX: ???
     const data = self.ast.nodes.items(.data);
     const bytes_node = switch (sign) {
         .positive => data[node].lhs,
         .negative => node,
     };
     const bytes = self.ast.tokenSlice(bytes_node);
-    std.debug.print("bytes: {s}\n", .{bytes});
     const unsigned_float = std.fmt.parseFloat(Float, bytes) catch unreachable;
     const result = switch (sign) {
         .negative => -unsigned_float,
@@ -298,7 +265,6 @@ test "parse int" {
     try std.testing.expectEqual(@as(i8, -1), try parse(allocator, i8, "-1.0"));
     try std.testing.expectEqual(@as(i8, 123), try parse(allocator, i8, "123.0"));
 
-    // XXX: test bases with big integers?
     // Test non-decimal integers
     try std.testing.expectEqual(@as(i16, 0xff), try parse(allocator, i16, "0xff"));
     try std.testing.expectEqual(@as(i16, -0xff), try parse(allocator, i16, "-0xff"));
@@ -384,23 +350,16 @@ test "parse float" {
         @as(f32, -36893488147419103231),
         try parse(allocator, f32, "-36893488147419103231"),
     );
-    // XXX: ...
-    // std.debug.print("a: {x}\n", .{@as(f32, 0x1ffffffffffffffff)});
-    // std.debug.print("b: {x}\n", .{std.fmt.parseFloat(f32, "0x1ffffffffffffffff") catch unreachable});
     try std.testing.expectEqual(@as(f128, 0x1ffffffffffffffff), try parse(
         allocator,
         f128,
         "0x1ffffffffffffffff",
     ));
-    comptime assert(@as(f32, 0x1ffffffffffffffff) == @intToFloat(f32, std.fmt.parseInt(u66, "1ffffffffffffffff", 16) catch unreachable));
-    // comptime assert(@as(f32, 0x1ffffffffffffffff) == std.math.inf(f32));
-    // const f: f128 = 0x1ffffffffffffffff;
-    // const fs: f32 = f;
-    // try std.testing.expectEqual(fs, try parse(
-    //     allocator,
-    //     f32,
-    //     "0x1ffffffffffffffff",
-    // ));
+    try std.testing.expectEqual(@as(f32, 0x1ffffffffffffffff), try parse(
+        allocator,
+        f32,
+        "0x1ffffffffffffffff",
+    ));
 
     // Exponents, underscores
     try std.testing.expectEqual(@as(f32, 123.0E+77), try parse(allocator, f32, "12_3.0E+77"));
@@ -413,3 +372,10 @@ test "parse float" {
         try parse(allocator, f32, "0x1234_5678.9ABC_CDEFp-10"),
     );
 }
+
+// TODO: zig float parsing bug example
+// test "bug" {
+//     const float: f32 = 0xffffffffffffffff;
+//     const parsed = try std.fmt.parseFloat(f32, "0xffffffffffffffff.0p0");
+//     try std.testing.expectEqual(float, parsed);
+// }
