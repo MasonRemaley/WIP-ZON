@@ -39,7 +39,7 @@ pub fn Result(comptime T: type) type {
             self.* = undefined;
         }
 
-        // XXX: make a render errors function...
+        // TODO: make a render errors function...
     };
 }
 
@@ -168,14 +168,13 @@ test "parse bool" {
     }
 }
 
-const Sign = enum { positive, negative };
-
 fn parseNumber(self: *Parser, comptime T: type, node: NodeIndex) error{Type}!T {
     const tags = self.ast.nodes.items(.tag);
     const data = self.ast.nodes.items(.data);
+    const main_tokens = self.ast.nodes.items(.main_token);
     return switch (tags[node]) {
-        .negation => try self.parseNumberWithSign(T, data[node].lhs, .negative),
-        else => try self.parseNumberWithSign(T, node, .positive),
+        .negation => try self.parseNumberWithSign(T, data[node].lhs, main_tokens[node]),
+        else => try self.parseNumberWithSign(T, node, null),
     };
 }
 
@@ -183,12 +182,12 @@ fn parseNumberWithSign(
     self: *Parser,
     comptime T: type,
     node: NodeIndex,
-    sign: Sign,
+    neg_token: ?TokenIndex,
 ) error{Type}!T {
     const tags = self.ast.nodes.items(.tag);
     switch (tags[node]) {
-        .number_literal => return self.parseNumberLiteral(T, node, sign),
-        .char_literal => return self.parseCharLiteral(T, node, sign),
+        .number_literal => return self.parseNumberLiteral(T, node, neg_token),
+        .char_literal => return self.parseCharLiteral(T, node, neg_token),
         else => {
             const main_tokens = self.ast.nodes.items(.main_token);
             const token = main_tokens[node];
@@ -197,28 +196,26 @@ fn parseNumberWithSign(
     }
 }
 
-fn parseNumberLiteral(self: *Parser, comptime T: type, node: NodeIndex, sign: Sign) error{Type}!T {
+fn parseNumberLiteral(self: *Parser, comptime T: type, node: NodeIndex, neg_token: ?TokenIndex) error{Type}!T {
     const main_tokens = self.ast.nodes.items(.main_token);
     const num_lit_token = main_tokens[node];
     const token_bytes = self.ast.tokenSlice(num_lit_token);
     const number = std.zig.number_literal.parseNumberLiteral(token_bytes);
+
+    const data = self.ast.nodes.items(.data);
+    const bytes_node = if (neg_token != null) node else data[node].lhs;
+
     switch (number) {
-        .int => |int| return self.applySignToInt(T, num_lit_token, sign, int),
-        .big_int => |base| return self.parseBigNumber(T, sign, node, base),
-        .float => return self.parseFloat(T, sign, node),
+        .int => |int| return self.applySignToInt(T, neg_token orelse num_lit_token, neg_token != null, int),
+        .big_int => |base| return self.parseBigNumber(T, neg_token, bytes_node, base),
+        .float => return self.parseFloat(T, neg_token, bytes_node),
         else => unreachable,
     }
 }
 
-fn applySignToInt(self: *Parser, comptime T: type, token: TokenIndex, sign: Sign, int: anytype) error{Type}!T {
-    switch (sign) {
-        .positive => switch (@typeInfo(T)) {
-            .Int => return std.math.cast(T, int) orelse
-                self.failCannotRepresent(T, token),
-            .Float => return @intToFloat(T, int),
-            else => @compileError("expected numeric type"),
-        },
-        .negative => switch (@typeInfo(T)) {
+fn applySignToInt(self: *Parser, comptime T: type, token: TokenIndex, negative: bool, int: anytype) error{Type}!T {
+    if (negative) {
+        switch (@typeInfo(T)) {
             .Int => |int_type| switch (int_type.signedness) {
                 .signed => {
                     const Positive = @Type(.{ .Int = .{
@@ -235,35 +232,36 @@ fn applySignToInt(self: *Parser, comptime T: type, token: TokenIndex, sign: Sign
             },
             .Float => return -@intToFloat(T, int),
             else => @compileError("expected numeric type"),
-        },
+        }
+    } else {
+        switch (@typeInfo(T)) {
+            .Int => return std.math.cast(T, int) orelse
+                self.failCannotRepresent(T, token),
+            .Float => return @intToFloat(T, int),
+            else => @compileError("expected numeric type"),
+        }
     }
 }
 
 fn parseBigNumber(
     self: *Parser,
     comptime T: type,
-    sign: Sign,
+    neg_token: ?TokenIndex,
     node: NodeIndex,
     base: Base,
 ) error{Type}!T {
     switch (@typeInfo(T)) {
-        .Int => return self.parseBigInt(T, sign, node, base),
+        .Int => return self.parseBigInt(T, neg_token, node, base),
         // TODO: passing in f128 to work around possible float parsing bug
-        .Float => return @floatCast(T, try self.parseFloat(f128, sign, node)),
+        .Float => return @floatCast(T, try self.parseFloat(f128, neg_token, node)),
         else => unreachable,
     }
 }
 
-// XXX: test overflow errors
-fn parseBigInt(self: *Parser, comptime T: type, sign: Sign, node: NodeIndex, base: Base) error{Type}!T {
+fn parseBigInt(self: *Parser, comptime T: type, neg_token: ?TokenIndex, node: NodeIndex, base: Base) error{Type}!T {
     const main_tokens = self.ast.nodes.items(.main_token);
-    const token = main_tokens[node];
-    const data = self.ast.nodes.items(.data);
-    const bytes_node = switch (sign) {
-        .positive => data[node].lhs,
-        .negative => node,
-    };
-    const bytes = self.ast.tokenSlice(bytes_node);
+    const token = neg_token orelse main_tokens[node];
+    const bytes = self.ast.tokenSlice(node);
     const prefix_offset = @as(u8, 2) * @boolToInt(base != .decimal);
     var result: T = 0;
     for (bytes[prefix_offset..]) |char| {
@@ -271,11 +269,12 @@ fn parseBigInt(self: *Parser, comptime T: type, sign: Sign, node: NodeIndex, bas
         const d = std.fmt.charToDigit(char, @enumToInt(base)) catch unreachable;
         result = std.math.mul(T, result, @intCast(T, @enumToInt(base))) catch
             return self.failCannotRepresent(T, token);
-        switch (sign) {
-            .positive => result = std.math.add(T, result, @intCast(T, d)) catch
-                return self.failCannotRepresent(T, token),
-            .negative => result = std.math.sub(T, result, @intCast(T, d)) catch
-                return self.failCannotRepresent(T, token),
+        if (neg_token != null) {
+            result = std.math.sub(T, result, @intCast(T, d)) catch
+                return self.failCannotRepresent(T, token);
+        } else {
+            result = std.math.add(T, result, @intCast(T, d)) catch
+                return self.failCannotRepresent(T, token);
         }
     }
     return result;
@@ -284,7 +283,7 @@ fn parseBigInt(self: *Parser, comptime T: type, sign: Sign, node: NodeIndex, bas
 fn parseFloat(
     self: *Parser,
     comptime T: type,
-    sign: Sign,
+    neg_token: ?TokenIndex,
     node: NodeIndex,
 ) error{Type}!T {
     const Float = switch (@typeInfo(T)) {
@@ -292,33 +291,27 @@ fn parseFloat(
         .Int => f128,
         else => unreachable,
     };
-    const data = self.ast.nodes.items(.data);
-    const bytes_node = switch (sign) {
-        .positive => data[node].lhs,
-        .negative => node,
-    };
+    // const data = self.ast.nodes.items(.data);
+    const bytes_node = node; //if (neg_token != null) node else data[node].lhs;
     const bytes = self.ast.tokenSlice(bytes_node);
     const unsigned_float = std.fmt.parseFloat(Float, bytes) catch unreachable;
-    const result = switch (sign) {
-        .negative => -unsigned_float,
-        .positive => unsigned_float,
-    };
+    const result = if (neg_token != null) -unsigned_float else unsigned_float;
     if (T == Float) {
         return result;
     } else {
         const main_tokens = self.ast.nodes.items(.main_token);
-        const token = main_tokens[node];
+        const token = neg_token orelse main_tokens[node];
         return floatToInt(T, result) orelse
             self.failCannotRepresent(T, token);
     }
 }
 
-fn parseCharLiteral(self: *Parser, comptime T: type, node: NodeIndex, sign: Sign) error{Type}!T {
+fn parseCharLiteral(self: *Parser, comptime T: type, node: NodeIndex, neg_token: ?TokenIndex) error{Type}!T {
     const main_tokens = self.ast.nodes.items(.main_token);
     const num_lit_token = main_tokens[node];
     const token_bytes = self.ast.tokenSlice(num_lit_token);
     const char = std.zig.string_literal.parseCharLiteral(token_bytes).success;
-    return self.applySignToInt(T, num_lit_token, sign, char);
+    return self.applySignToInt(T, neg_token orelse num_lit_token, neg_token != null, char);
 }
 
 // TODO: move to std.math?
@@ -410,6 +403,30 @@ test "parse int" {
         @as(i66, -36893488147419103232),
         try parseThenFree(allocator, i66, "-36893488147419103232"),
     );
+    {
+        var result = try parse(allocator, i66, "36893488147419103232");
+        defer result.deinit(allocator);
+        try std.testing.expect(std.mem.eql(u8, result.value.type_error.cannot_represent.name, @typeName(i66)));
+        const location = result.ast.tokenLocation(0, result.value.type_error.cannot_represent.token);
+        try std.testing.expectEqual(Ast.Location{
+            .line = 0,
+            .column = 0,
+            .line_start = 0,
+            .line_end = 20,
+        }, location);
+    }
+    {
+        var result = try parse(allocator, i66, "-36893488147419103233");
+        defer result.deinit(allocator);
+        try std.testing.expect(std.mem.eql(u8, result.value.type_error.cannot_represent.name, @typeName(i66)));
+        const location = result.ast.tokenLocation(0, result.value.type_error.cannot_represent.token);
+        try std.testing.expectEqual(Ast.Location{
+            .line = 0,
+            .column = 0,
+            .line_start = 0,
+            .line_end = 21,
+        }, location);
+    }
 
     // Test parsing whole number floats as integers
     try std.testing.expectEqual(@as(i8, -1), try parseThenFree(allocator, i8, "-1.0"));
@@ -506,8 +523,7 @@ test "parse int" {
         const location = result.ast.tokenLocation(0, result.value.type_error.cannot_represent.token);
         try std.testing.expectEqual(Ast.Location{
             .line = 0,
-            // XXX: should point at the minus sign...?
-            .column = 1,
+            .column = 0,
             .line_start = 0,
             .line_end = 4,
         }, location);
@@ -521,8 +537,7 @@ test "parse int" {
         const location = result.ast.tokenLocation(0, result.value.type_error.cannot_represent.token);
         try std.testing.expectEqual(Ast.Location{
             .line = 0,
-            // XXX: should point at the minus sign?
-            .column = 1,
+            .column = 0,
             .line_start = 0,
             .line_end = 2,
         }, location);
@@ -550,8 +565,7 @@ test "parse int" {
         const location = result.ast.tokenLocation(0, result.value.type_error.cannot_represent.token);
         try std.testing.expectEqual(Ast.Location{
             .line = 0,
-            // XXX: column should be 0
-            .column = 1,
+            .column = 0,
             .line_start = 0,
             .line_end = 4,
         }, location);
