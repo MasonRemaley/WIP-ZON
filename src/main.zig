@@ -12,9 +12,11 @@ const Parser = @This();
 
 allocator: Allocator,
 ast: *const Ast,
-err: ?Error = null,
+err: ?*Error,
 
+// XXX: naming?
 pub const Error = union(enum) {
+    success: void,
     expected_type: struct {
         name: []const u8,
         node: NodeIndex,
@@ -38,40 +40,94 @@ pub fn Result(comptime T: type) type {
     };
 }
 
-pub fn parse(allocator: Allocator, comptime T: type, ast: *const Ast) Allocator.Error!Result(T) {
+pub fn parse(allocator: Allocator, comptime T: type, ast: *const Ast, err: ?*Error) error{ OutOfMemory, Type }!T {
     var parser = Parser{
         .allocator = allocator,
         .ast = ast,
+        .err = err,
     };
     const data = ast.nodes.items(.data);
     // TODO: why lhs here?
     const root = data[0].lhs;
-    const success = parser.parseValue(T, root) catch |err| switch (err) {
-        error.Type => return .{ .err = parser.err.? },
-    };
-
-    return .{ .success = success };
+    return parser.parseExpr(T, root);
 }
 
-fn testParseFree(allocator: Allocator, comptime T: type, source: [:0]const u8) error{ OutOfMemory, Type }!T {
+pub fn parseSlice(allocator: Allocator, comptime T: type, source: [:0]const u8) error{ OutOfMemory, Type }!T {
     var ast = try std.zig.Ast.parse(allocator, source, .zon);
     defer ast.deinit(allocator);
     assert(ast.errors.len == 0);
-    var result = try parse(allocator, T, &ast);
-    defer result.deinit(allocator);
-    switch (result) {
-        .err => return error.Type,
-        .success => |success| return success,
+    return parse(allocator, T, &ast, null);
+}
+
+pub fn parseFree(allocator: Allocator, value: anytype) void {
+    switch (@typeInfo(@TypeOf(value))) {
+        .Bool, .Int, .Float, .Enum => {},
+        // TODO: chase pointer once that's implemented
+        // TODO: free vs desotry?
+        .Pointer => return allocator.free(value),
+        else => unreachable,
     }
 }
 
-pub fn parseValue(self: *Parser, comptime T: type, node: NodeIndex) error{Type}!T {
+pub fn parseExpr(self: *Parser, comptime T: type, node: NodeIndex) error{ OutOfMemory, Type }!T {
     switch (@typeInfo(T)) {
         .Bool => return self.parseBool(node),
         .Int, .Float => return self.parseNumber(T, node),
         .Enum => return self.parseEnumLiteral(T, node),
+        .Pointer => return self.parsePointer(T, node),
+        // TODO: keep in sync with parseFree
         else => unreachable,
     }
+}
+
+fn parsePointer(self: *Parser, comptime T: type, node: NodeIndex) error{ OutOfMemory, Type }!T {
+    const tags = self.ast.nodes.items(.tag);
+    return switch (tags[node]) {
+        .string_literal => try self.parseStringLiteral(T, node),
+        // XXX: support other slice syntaxes!
+        else => return self.failExpectedType(T, node),
+    };
+}
+
+fn parseStringLiteral(self: *Parser, comptime T: type, node: NodeIndex) error{ OutOfMemory, Type }!T {
+    // XXX: 0 terminated?
+    // XXX: wide strings?
+    // XXX: is a 'c' single char allowed as a string literal?
+    // XXX: just assuming slice for now...allow all variants where possible in zig too
+    const Pointer = @typeInfo(T).Pointer;
+    switch (Pointer.size) {
+        .Slice => {},
+        .One, .Many, .C => unreachable,
+    }
+    // XXX: assuming u8 for now...not sure if correct or not
+    if (Pointer.child != u8) unreachable;
+
+    const tokens = self.ast.nodes.items(.main_token);
+    const token = tokens[node];
+    const raw_string = self.ast.tokenSlice(token);
+    // XXX: handle errors here...not caught by parser right?
+    return std.zig.string_literal.parseAlloc(self.allocator, raw_string) catch unreachable;
+}
+
+test "string literal" {
+    const allocator = std.testing.allocator;
+
+    // Basic string literal
+    {
+        const parsed = try parseSlice(allocator, []const u8, "\"abc\"");
+        defer parseFree(allocator, parsed);
+        try std.testing.expectEqualSlices(u8, @as([]const u8, "abc"), parsed);
+    }
+
+    // String literal with escape characters
+    {
+        const parsed = try parseSlice(allocator, []const u8, "\"ab\\nc\"");
+        defer parseFree(allocator, parsed);
+        try std.testing.expectEqualSlices(u8, @as([]const u8, "ab\nc"), parsed);
+    }
+
+    // XXX: change to have a parser that stores the error instead of returning a union
+    // XXX: test escape characters, mutable vs non mutable, freeing, limited size strings etc
 }
 
 // TODO: cannot represent not quite right error for unknown field right?
@@ -124,18 +180,18 @@ test "enum literals" {
     };
 
     // Tags that exist
-    try std.testing.expectEqual(Enum.foo, try testParseFree(allocator, Enum, ".foo"));
-    try std.testing.expectEqual(Enum.bar, try testParseFree(allocator, Enum, ".bar"));
-    try std.testing.expectEqual(Enum.baz, try testParseFree(allocator, Enum, ".baz"));
+    try std.testing.expectEqual(Enum.foo, try parseSlice(allocator, Enum, ".foo"));
+    try std.testing.expectEqual(Enum.bar, try parseSlice(allocator, Enum, ".bar"));
+    try std.testing.expectEqual(Enum.baz, try parseSlice(allocator, Enum, ".baz"));
 
     // Bad tag
     {
         var ast = try std.zig.Ast.parse(allocator, ".qux", .zon);
         defer ast.deinit(allocator);
-        var result = try parse(allocator, Enum, &ast);
-        defer result.deinit(allocator);
-        try std.testing.expect(std.mem.eql(u8, result.err.cannot_represent.name, @typeName(Enum)));
-        const node = result.err.cannot_represent.node;
+        var err: Error = .success; // XXX: do i need to label type?
+        try std.testing.expectError(error.Type, parse(allocator, Enum, &ast, &err));
+        try std.testing.expect(std.mem.eql(u8, err.cannot_represent.name, @typeName(Enum)));
+        const node = err.cannot_represent.node;
         const tokens = ast.nodes.items(.main_token);
         const token = tokens[node];
         const location = ast.tokenLocation(0, token);
@@ -151,10 +207,10 @@ test "enum literals" {
     {
         var ast = try std.zig.Ast.parse(allocator, "true", .zon);
         defer ast.deinit(allocator);
-        var result = try parse(allocator, Enum, &ast);
-        defer result.deinit(allocator);
-        try std.testing.expect(std.mem.eql(u8, result.err.expected_type.name, @typeName(Enum)));
-        const node = result.err.expected_type.node;
+        var err: Error = .success; // XXX: do i need to label type?
+        try std.testing.expectError(error.Type, parse(allocator, Enum, &ast, &err));
+        try std.testing.expect(std.mem.eql(u8, err.expected_type.name, @typeName(Enum)));
+        const node = err.expected_type.node;
         const tokens = ast.nodes.items(.main_token);
         const token = tokens[node];
         const location = ast.tokenLocation(0, token);
@@ -181,19 +237,20 @@ test "numeric enum literals" {
     };
 
     // Test parsing numbers as enums
-    try std.testing.expectEqual(Enum.zero, try testParseFree(allocator, Enum, "0"));
-    try std.testing.expectEqual(Enum.three, try testParseFree(allocator, Enum, "3"));
-    try std.testing.expectEqual(SignedEnum.zero, try testParseFree(allocator, SignedEnum, "0"));
-    try std.testing.expectEqual(SignedEnum.three, try testParseFree(allocator, SignedEnum, "-3"));
+    try std.testing.expectEqual(Enum.zero, try parseSlice(allocator, Enum, "0"));
+    try std.testing.expectEqual(Enum.three, try parseSlice(allocator, Enum, "3"));
+    try std.testing.expectEqual(SignedEnum.zero, try parseSlice(allocator, SignedEnum, "0"));
+    try std.testing.expectEqual(SignedEnum.three, try parseSlice(allocator, SignedEnum, "-3"));
 
     // Bad tag
     {
         var ast = try std.zig.Ast.parse(allocator, "2", .zon);
         defer ast.deinit(allocator);
-        var result = try parse(allocator, Enum, &ast);
-        defer result.deinit(allocator);
-        try std.testing.expect(std.mem.eql(u8, result.err.cannot_represent.name, @typeName(Enum)));
-        const node = result.err.cannot_represent.node;
+        var err: Error = .success; // XXX: do i need to label type?
+        try std.testing.expectError(error.Type, parse(allocator, Enum, &ast, &err));
+        // XXX: use expect slice for these
+        try std.testing.expect(std.mem.eql(u8, err.cannot_represent.name, @typeName(Enum)));
+        const node = err.cannot_represent.node;
         const tokens = ast.nodes.items(.main_token);
         const token = tokens[node];
         const location = ast.tokenLocation(0, token);
@@ -209,10 +266,10 @@ test "numeric enum literals" {
     {
         var ast = try std.zig.Ast.parse(allocator, "256", .zon);
         defer ast.deinit(allocator);
-        var result = try parse(allocator, Enum, &ast);
-        defer result.deinit(allocator);
-        try std.testing.expect(std.mem.eql(u8, result.err.cannot_represent.name, @typeName(Enum)));
-        const node = result.err.cannot_represent.node;
+        var err: Error = .success; // XXX: do i need to label type?
+        try std.testing.expectError(error.Type, parse(allocator, Enum, &ast, &err));
+        try std.testing.expect(std.mem.eql(u8, err.cannot_represent.name, @typeName(Enum)));
+        const node = err.cannot_represent.node;
         const tokens = ast.nodes.items(.main_token);
         const token = tokens[node];
         const location = ast.tokenLocation(0, token);
@@ -228,10 +285,10 @@ test "numeric enum literals" {
     {
         var ast = try std.zig.Ast.parse(allocator, "-3", .zon);
         defer ast.deinit(allocator);
-        var result = try parse(allocator, Enum, &ast);
-        defer result.deinit(allocator);
-        try std.testing.expect(std.mem.eql(u8, result.err.cannot_represent.name, @typeName(Enum)));
-        const node = result.err.cannot_represent.node;
+        var err: Error = .success; // XXX: do i need to label type?
+        try std.testing.expectError(error.Type, parse(allocator, Enum, &ast, &err));
+        try std.testing.expect(std.mem.eql(u8, err.cannot_represent.name, @typeName(Enum)));
+        const node = err.cannot_represent.node;
         const tokens = ast.nodes.items(.main_token);
         const token = tokens[node];
         const location = ast.tokenLocation(0, token);
@@ -247,10 +304,10 @@ test "numeric enum literals" {
     {
         var ast = try std.zig.Ast.parse(allocator, "1.5", .zon);
         defer ast.deinit(allocator);
-        var result = try parse(allocator, Enum, &ast);
-        defer result.deinit(allocator);
-        try std.testing.expect(std.mem.eql(u8, result.err.cannot_represent.name, @typeName(Enum)));
-        const node = result.err.cannot_represent.node;
+        var err: Error = .success; // XXX: do i need to label type?
+        try std.testing.expectError(error.Type, parse(allocator, Enum, &ast, &err));
+        try std.testing.expect(std.mem.eql(u8, err.cannot_represent.name, @typeName(Enum)));
+        const node = err.cannot_represent.node;
         const tokens = ast.nodes.items(.main_token);
         const token = tokens[node];
         const location = ast.tokenLocation(0, token);
@@ -265,11 +322,14 @@ test "numeric enum literals" {
     // TODO: name general purpose allocators gpa!
 }
 
+// XXX: How do I free the results if failure occurs?
 fn fail(self: *Parser, err: Error) error{Type} {
     @setCold(true);
     // XXX: ...commented out cause of dup error handling
     // assert(self.err == null);
-    self.err = err;
+    if (self.err) |e| {
+        e.* = err;
+    }
     return error.Type;
 }
 
@@ -311,17 +371,17 @@ test "parse bool" {
     const allocator = std.testing.allocator;
 
     // Correct floats
-    try std.testing.expectEqual(true, try testParseFree(allocator, bool, "true"));
-    try std.testing.expectEqual(false, try testParseFree(allocator, bool, "false"));
+    try std.testing.expectEqual(true, try parseSlice(allocator, bool, "true"));
+    try std.testing.expectEqual(false, try parseSlice(allocator, bool, "false"));
 
     // Errors
     {
         var ast = try std.zig.Ast.parse(allocator, " foo", .zon);
         defer ast.deinit(allocator);
-        var result = try parse(allocator, bool, &ast);
-        defer result.deinit(allocator);
-        try std.testing.expect(std.mem.eql(u8, result.err.expected_type.name, @typeName(bool)));
-        const node = result.err.expected_type.node;
+        var err: Error = .success; // XXX: do i need to label type?
+        try std.testing.expectError(error.Type, parse(allocator, bool, &ast, &err));
+        try std.testing.expect(std.mem.eql(u8, err.expected_type.name, @typeName(bool)));
+        const node = err.expected_type.node;
         const tokens = ast.nodes.items(.main_token);
         const token = tokens[node];
         const location = ast.tokenLocation(0, token);
@@ -335,10 +395,10 @@ test "parse bool" {
     {
         var ast = try std.zig.Ast.parse(allocator, "123", .zon);
         defer ast.deinit(allocator);
-        var result = try parse(allocator, bool, &ast);
-        defer result.deinit(allocator);
-        try std.testing.expect(std.mem.eql(u8, result.err.expected_type.name, @typeName(bool)));
-        const node = result.err.expected_type.node;
+        var err: Error = .success; // XXX: do i need to label type?
+        try std.testing.expectError(error.Type, parse(allocator, bool, &ast, &err));
+        try std.testing.expect(std.mem.eql(u8, err.expected_type.name, @typeName(bool)));
+        const node = err.expected_type.node;
         const tokens = ast.nodes.items(.main_token);
         const token = tokens[node];
         const location = ast.tokenLocation(0, token);
@@ -555,45 +615,45 @@ test "parse int" {
     const allocator = std.testing.allocator;
 
     // Test various numbers and types
-    try std.testing.expectEqual(@as(u8, 10), try testParseFree(allocator, u8, "10"));
-    try std.testing.expectEqual(@as(i16, 24), try testParseFree(allocator, i16, "24"));
-    try std.testing.expectEqual(@as(i14, -4), try testParseFree(allocator, i14, "-4"));
-    try std.testing.expectEqual(@as(i32, -123), try testParseFree(allocator, i32, "-123"));
+    try std.testing.expectEqual(@as(u8, 10), try parseSlice(allocator, u8, "10"));
+    try std.testing.expectEqual(@as(i16, 24), try parseSlice(allocator, i16, "24"));
+    try std.testing.expectEqual(@as(i14, -4), try parseSlice(allocator, i14, "-4"));
+    try std.testing.expectEqual(@as(i32, -123), try parseSlice(allocator, i32, "-123"));
 
     // Test limits
-    try std.testing.expectEqual(@as(i8, 127), try testParseFree(allocator, i8, "127"));
-    try std.testing.expectEqual(@as(i8, -128), try testParseFree(allocator, i8, "-128"));
+    try std.testing.expectEqual(@as(i8, 127), try parseSlice(allocator, i8, "127"));
+    try std.testing.expectEqual(@as(i8, -128), try parseSlice(allocator, i8, "-128"));
 
     // Test characters
-    try std.testing.expectEqual(@as(u8, 'a'), try testParseFree(allocator, u8, "'a'"));
-    try std.testing.expectEqual(@as(u8, 'z'), try testParseFree(allocator, u8, "'z'"));
+    try std.testing.expectEqual(@as(u8, 'a'), try parseSlice(allocator, u8, "'a'"));
+    try std.testing.expectEqual(@as(u8, 'z'), try parseSlice(allocator, u8, "'z'"));
 
     // Test big integers
     try std.testing.expectEqual(
         @as(u65, 36893488147419103231),
-        try testParseFree(allocator, u65, "36893488147419103231"),
+        try parseSlice(allocator, u65, "36893488147419103231"),
     );
     try std.testing.expectEqual(
         @as(u65, 36893488147419103231),
-        try testParseFree(allocator, u65, "368934_881_474191032_31"),
+        try parseSlice(allocator, u65, "368934_881_474191032_31"),
     );
 
     // Test big integer limits
     try std.testing.expectEqual(
         @as(i66, 36893488147419103231),
-        try testParseFree(allocator, i66, "36893488147419103231"),
+        try parseSlice(allocator, i66, "36893488147419103231"),
     );
     try std.testing.expectEqual(
         @as(i66, -36893488147419103232),
-        try testParseFree(allocator, i66, "-36893488147419103232"),
+        try parseSlice(allocator, i66, "-36893488147419103232"),
     );
     {
         var ast = try std.zig.Ast.parse(allocator, "36893488147419103232", .zon);
         defer ast.deinit(allocator);
-        var result = try parse(allocator, i66, &ast);
-        defer result.deinit(allocator);
-        try std.testing.expect(std.mem.eql(u8, result.err.cannot_represent.name, @typeName(i66)));
-        const node = result.err.cannot_represent.node;
+        var err: Error = .success; // XXX: do i need to label type?
+        try std.testing.expectError(error.Type, parse(allocator, i66, &ast, &err));
+        try std.testing.expect(std.mem.eql(u8, err.cannot_represent.name, @typeName(i66)));
+        const node = err.cannot_represent.node;
         const tokens = ast.nodes.items(.main_token);
         const token = tokens[node];
         const location = ast.tokenLocation(0, token);
@@ -607,10 +667,10 @@ test "parse int" {
     {
         var ast = try std.zig.Ast.parse(allocator, "-36893488147419103233", .zon);
         defer ast.deinit(allocator);
-        var result = try parse(allocator, i66, &ast);
-        defer result.deinit(allocator);
-        try std.testing.expect(std.mem.eql(u8, result.err.cannot_represent.name, @typeName(i66)));
-        const node = result.err.cannot_represent.node;
+        var err: Error = .success; // XXX: do i need to label type?
+        try std.testing.expectError(error.Type, parse(allocator, i66, &ast, &err));
+        try std.testing.expect(std.mem.eql(u8, err.cannot_represent.name, @typeName(i66)));
+        const node = err.cannot_represent.node;
         const tokens = ast.nodes.items(.main_token);
         const token = tokens[node];
         const location = ast.tokenLocation(0, token);
@@ -623,59 +683,59 @@ test "parse int" {
     }
 
     // Test parsing whole number floats as integers
-    try std.testing.expectEqual(@as(i8, -1), try testParseFree(allocator, i8, "-1.0"));
-    try std.testing.expectEqual(@as(i8, 123), try testParseFree(allocator, i8, "123.0"));
+    try std.testing.expectEqual(@as(i8, -1), try parseSlice(allocator, i8, "-1.0"));
+    try std.testing.expectEqual(@as(i8, 123), try parseSlice(allocator, i8, "123.0"));
 
     // Test non-decimal integers
-    try std.testing.expectEqual(@as(i16, 0xff), try testParseFree(allocator, i16, "0xff"));
-    try std.testing.expectEqual(@as(i16, -0xff), try testParseFree(allocator, i16, "-0xff"));
-    try std.testing.expectEqual(@as(i16, 0o77), try testParseFree(allocator, i16, "0o77"));
-    try std.testing.expectEqual(@as(i16, -0o77), try testParseFree(allocator, i16, "-0o77"));
-    try std.testing.expectEqual(@as(i16, 0b11), try testParseFree(allocator, i16, "0b11"));
-    try std.testing.expectEqual(@as(i16, -0b11), try testParseFree(allocator, i16, "-0b11"));
+    try std.testing.expectEqual(@as(i16, 0xff), try parseSlice(allocator, i16, "0xff"));
+    try std.testing.expectEqual(@as(i16, -0xff), try parseSlice(allocator, i16, "-0xff"));
+    try std.testing.expectEqual(@as(i16, 0o77), try parseSlice(allocator, i16, "0o77"));
+    try std.testing.expectEqual(@as(i16, -0o77), try parseSlice(allocator, i16, "-0o77"));
+    try std.testing.expectEqual(@as(i16, 0b11), try parseSlice(allocator, i16, "0b11"));
+    try std.testing.expectEqual(@as(i16, -0b11), try parseSlice(allocator, i16, "-0b11"));
 
     // Test non-decimal big integers
-    try std.testing.expectEqual(@as(u65, 0x1ffffffffffffffff), try testParseFree(
+    try std.testing.expectEqual(@as(u65, 0x1ffffffffffffffff), try parseSlice(
         allocator,
         u65,
         "0x1ffffffffffffffff",
     ));
-    try std.testing.expectEqual(@as(i66, 0x1ffffffffffffffff), try testParseFree(
+    try std.testing.expectEqual(@as(i66, 0x1ffffffffffffffff), try parseSlice(
         allocator,
         i66,
         "0x1ffffffffffffffff",
     ));
-    try std.testing.expectEqual(@as(i66, -0x1ffffffffffffffff), try testParseFree(
+    try std.testing.expectEqual(@as(i66, -0x1ffffffffffffffff), try parseSlice(
         allocator,
         i66,
         "-0x1ffffffffffffffff",
     ));
-    try std.testing.expectEqual(@as(u65, 0x1ffffffffffffffff), try testParseFree(
+    try std.testing.expectEqual(@as(u65, 0x1ffffffffffffffff), try parseSlice(
         allocator,
         u65,
         "0o3777777777777777777777",
     ));
-    try std.testing.expectEqual(@as(i66, 0x1ffffffffffffffff), try testParseFree(
+    try std.testing.expectEqual(@as(i66, 0x1ffffffffffffffff), try parseSlice(
         allocator,
         i66,
         "0o3777777777777777777777",
     ));
-    try std.testing.expectEqual(@as(i66, -0x1ffffffffffffffff), try testParseFree(
+    try std.testing.expectEqual(@as(i66, -0x1ffffffffffffffff), try parseSlice(
         allocator,
         i66,
         "-0o3777777777777777777777",
     ));
-    try std.testing.expectEqual(@as(u65, 0x1ffffffffffffffff), try testParseFree(
+    try std.testing.expectEqual(@as(u65, 0x1ffffffffffffffff), try parseSlice(
         allocator,
         u65,
         "0b11111111111111111111111111111111111111111111111111111111111111111",
     ));
-    try std.testing.expectEqual(@as(i66, 0x1ffffffffffffffff), try testParseFree(
+    try std.testing.expectEqual(@as(i66, 0x1ffffffffffffffff), try parseSlice(
         allocator,
         i66,
         "0b11111111111111111111111111111111111111111111111111111111111111111",
     ));
-    try std.testing.expectEqual(@as(i66, -0x1ffffffffffffffff), try testParseFree(
+    try std.testing.expectEqual(@as(i66, -0x1ffffffffffffffff), try parseSlice(
         allocator,
         i66,
         "-0b11111111111111111111111111111111111111111111111111111111111111111",
@@ -685,10 +745,10 @@ test "parse int" {
     {
         var ast = try std.zig.Ast.parse(allocator, "true", .zon);
         defer ast.deinit(allocator);
-        var result = try parse(allocator, u8, &ast);
-        defer result.deinit(allocator);
-        try std.testing.expect(std.mem.eql(u8, result.err.expected_type.name, @typeName(u8)));
-        const node = result.err.expected_type.node;
+        var err: Error = .success; // XXX: do i need to label type?
+        try std.testing.expectError(error.Type, parse(allocator, u8, &ast, &err));
+        try std.testing.expect(std.mem.eql(u8, err.expected_type.name, @typeName(u8)));
+        const node = err.expected_type.node;
         const tokens = ast.nodes.items(.main_token);
         const token = tokens[node];
         const location = ast.tokenLocation(0, token);
@@ -704,10 +764,10 @@ test "parse int" {
     {
         var ast = try std.zig.Ast.parse(allocator, "256", .zon);
         defer ast.deinit(allocator);
-        var result = try parse(allocator, u8, &ast);
-        defer result.deinit(allocator);
-        try std.testing.expect(std.mem.eql(u8, result.err.cannot_represent.name, @typeName(u8)));
-        const node = result.err.cannot_represent.node;
+        var err: Error = .success; // XXX: do i need to label type?
+        try std.testing.expectError(error.Type, parse(allocator, u8, &ast, &err));
+        try std.testing.expect(std.mem.eql(u8, err.cannot_represent.name, @typeName(u8)));
+        const node = err.cannot_represent.node;
         const tokens = ast.nodes.items(.main_token);
         const token = tokens[node];
         const location = ast.tokenLocation(0, token);
@@ -723,10 +783,10 @@ test "parse int" {
     {
         var ast = try std.zig.Ast.parse(allocator, "-129", .zon);
         defer ast.deinit(allocator);
-        var result = try parse(allocator, i8, &ast);
-        defer result.deinit(allocator);
-        try std.testing.expect(std.mem.eql(u8, result.err.cannot_represent.name, @typeName(i8)));
-        const node = result.err.cannot_represent.node;
+        var err: Error = .success; // XXX: do i need to label type?
+        try std.testing.expectError(error.Type, parse(allocator, i8, &ast, &err));
+        try std.testing.expect(std.mem.eql(u8, err.cannot_represent.name, @typeName(i8)));
+        const node = err.cannot_represent.node;
         const tokens = ast.nodes.items(.main_token);
         const token = tokens[node];
         const location = ast.tokenLocation(0, token);
@@ -742,10 +802,10 @@ test "parse int" {
     {
         var ast = try std.zig.Ast.parse(allocator, "-1", .zon);
         defer ast.deinit(allocator);
-        var result = try parse(allocator, u8, &ast);
-        defer result.deinit(allocator);
-        try std.testing.expect(std.mem.eql(u8, result.err.cannot_represent.name, @typeName(u8)));
-        const node = result.err.cannot_represent.node;
+        var err: Error = .success; // XXX: do i need to label type?
+        try std.testing.expectError(error.Type, parse(allocator, u8, &ast, &err));
+        try std.testing.expect(std.mem.eql(u8, err.cannot_represent.name, @typeName(u8)));
+        const node = err.cannot_represent.node;
         const tokens = ast.nodes.items(.main_token);
         const token = tokens[node];
         const location = ast.tokenLocation(0, token);
@@ -761,10 +821,10 @@ test "parse int" {
     {
         var ast = try std.zig.Ast.parse(allocator, "1.5", .zon);
         defer ast.deinit(allocator);
-        var result = try parse(allocator, u8, &ast);
-        defer result.deinit(allocator);
-        try std.testing.expect(std.mem.eql(u8, result.err.cannot_represent.name, @typeName(u8)));
-        const node = result.err.cannot_represent.node;
+        var err: Error = .success; // XXX: do i need to label type?
+        try std.testing.expectError(error.Type, parse(allocator, u8, &ast, &err));
+        try std.testing.expect(std.mem.eql(u8, err.cannot_represent.name, @typeName(u8)));
+        const node = err.cannot_represent.node;
         const tokens = ast.nodes.items(.main_token);
         const token = tokens[node];
         const location = ast.tokenLocation(0, token);
@@ -780,10 +840,10 @@ test "parse int" {
     {
         var ast = try std.zig.Ast.parse(allocator, "-1.0", .zon);
         defer ast.deinit(allocator);
-        var result = try parse(allocator, u8, &ast);
-        defer result.deinit(allocator);
-        try std.testing.expect(std.mem.eql(u8, result.err.cannot_represent.name, @typeName(u8)));
-        const node = result.err.cannot_represent.node;
+        var err: Error = .success; // XXX: do i need to label type?
+        try std.testing.expectError(error.Type, parse(allocator, u8, &ast, &err));
+        try std.testing.expect(std.mem.eql(u8, err.cannot_represent.name, @typeName(u8)));
+        const node = err.cannot_represent.node;
         const tokens = ast.nodes.items(.main_token);
         const token = tokens[node];
         const location = ast.tokenLocation(0, token);
@@ -800,51 +860,51 @@ test "parse float" {
     const allocator = std.testing.allocator;
 
     // Test decimals
-    try std.testing.expectEqual(@as(f16, 0.5), try testParseFree(allocator, f16, "0.5"));
-    try std.testing.expectEqual(@as(f32, 123.456), try testParseFree(allocator, f32, "123.456"));
-    try std.testing.expectEqual(@as(f64, -123.456), try testParseFree(allocator, f64, "-123.456"));
-    try std.testing.expectEqual(@as(f128, 42.5), try testParseFree(allocator, f128, "42.5"));
+    try std.testing.expectEqual(@as(f16, 0.5), try parseSlice(allocator, f16, "0.5"));
+    try std.testing.expectEqual(@as(f32, 123.456), try parseSlice(allocator, f32, "123.456"));
+    try std.testing.expectEqual(@as(f64, -123.456), try parseSlice(allocator, f64, "-123.456"));
+    try std.testing.expectEqual(@as(f128, 42.5), try parseSlice(allocator, f128, "42.5"));
 
     // Test whole numbers with and without decimals
-    try std.testing.expectEqual(@as(f16, 5.0), try testParseFree(allocator, f16, "5.0"));
-    try std.testing.expectEqual(@as(f16, 5.0), try testParseFree(allocator, f16, "5"));
-    try std.testing.expectEqual(@as(f32, -102), try testParseFree(allocator, f32, "-102.0"));
-    try std.testing.expectEqual(@as(f32, -102), try testParseFree(allocator, f32, "-102"));
+    try std.testing.expectEqual(@as(f16, 5.0), try parseSlice(allocator, f16, "5.0"));
+    try std.testing.expectEqual(@as(f16, 5.0), try parseSlice(allocator, f16, "5"));
+    try std.testing.expectEqual(@as(f32, -102), try parseSlice(allocator, f32, "-102.0"));
+    try std.testing.expectEqual(@as(f32, -102), try parseSlice(allocator, f32, "-102"));
 
     // Test characters and negated characters
-    try std.testing.expectEqual(@as(f32, 'a'), try testParseFree(allocator, f32, "'a'"));
-    try std.testing.expectEqual(@as(f32, 'z'), try testParseFree(allocator, f32, "'z'"));
-    try std.testing.expectEqual(@as(f32, -'z'), try testParseFree(allocator, f32, "-'z'"));
+    try std.testing.expectEqual(@as(f32, 'a'), try parseSlice(allocator, f32, "'a'"));
+    try std.testing.expectEqual(@as(f32, 'z'), try parseSlice(allocator, f32, "'z'"));
+    try std.testing.expectEqual(@as(f32, -'z'), try parseSlice(allocator, f32, "-'z'"));
 
     // Test big integers
     try std.testing.expectEqual(
         @as(f32, 36893488147419103231),
-        try testParseFree(allocator, f32, "36893488147419103231"),
+        try parseSlice(allocator, f32, "36893488147419103231"),
     );
     try std.testing.expectEqual(
         @as(f32, -36893488147419103231),
-        try testParseFree(allocator, f32, "-36893488147419103231"),
+        try parseSlice(allocator, f32, "-36893488147419103231"),
     );
-    try std.testing.expectEqual(@as(f128, 0x1ffffffffffffffff), try testParseFree(
+    try std.testing.expectEqual(@as(f128, 0x1ffffffffffffffff), try parseSlice(
         allocator,
         f128,
         "0x1ffffffffffffffff",
     ));
-    try std.testing.expectEqual(@as(f32, 0x1ffffffffffffffff), try testParseFree(
+    try std.testing.expectEqual(@as(f32, 0x1ffffffffffffffff), try parseSlice(
         allocator,
         f32,
         "0x1ffffffffffffffff",
     ));
 
     // Exponents, underscores
-    try std.testing.expectEqual(@as(f32, 123.0E+77), try testParseFree(allocator, f32, "12_3.0E+77"));
+    try std.testing.expectEqual(@as(f32, 123.0E+77), try parseSlice(allocator, f32, "12_3.0E+77"));
 
     // Hexadecimal
-    try std.testing.expectEqual(@as(f32, 0x103.70p-5), try testParseFree(allocator, f32, "0x103.70p-5"));
-    try std.testing.expectEqual(@as(f32, -0x103.70), try testParseFree(allocator, f32, "-0x103.70"));
+    try std.testing.expectEqual(@as(f32, 0x103.70p-5), try parseSlice(allocator, f32, "0x103.70p-5"));
+    try std.testing.expectEqual(@as(f32, -0x103.70), try parseSlice(allocator, f32, "-0x103.70"));
     try std.testing.expectEqual(
         @as(f32, 0x1234_5678.9ABC_CDEFp-10),
-        try testParseFree(allocator, f32, "0x1234_5678.9ABC_CDEFp-10"),
+        try parseSlice(allocator, f32, "0x1234_5678.9ABC_CDEFp-10"),
     );
 }
 
