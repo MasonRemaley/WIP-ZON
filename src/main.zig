@@ -78,13 +78,182 @@ pub fn parseValue(self: *Parser, comptime T: type, node: NodeIndex) error{Type}!
     switch (@typeInfo(T)) {
         .Bool => return self.parseBool(node),
         .Int, .Float => return self.parseNumber(T, node),
+        .Enum => return self.parseEnumLiteral(T, node),
         else => unreachable,
     }
 }
 
+fn parseEnumLiteral(self: *Parser, comptime T: type, node: NodeIndex) error{Type}!T {
+    const tags = self.ast.nodes.items(.tag);
+    const main_tokens = self.ast.nodes.items(.main_token);
+    const token = main_tokens[node];
+    return switch (tags[node]) {
+        .enum_literal => try self.parseEnumTag(T, node),
+        .number_literal, .negation => try self.parseEnumNumber(T, node),
+        else => return self.failExpectedType(T, token),
+    };
+}
+
+fn parseEnumNumber(self: *Parser, comptime T: type, node: NodeIndex) error{Type}!T {
+    const main_tokens = self.ast.nodes.items(.main_token);
+    const token = main_tokens[node];
+    // XXX: kinda weird dup error handling?
+    var number = self.parseNumber(@typeInfo(T).Enum.tag_type, node) catch
+        return self.failCannotRepresent(T, token);
+    return std.meta.intToEnum(T, number) catch
+        self.failCannotRepresent(T, token);
+}
+
+fn parseEnumTag(self: *Parser, comptime T: type, node: NodeIndex) error{Type}!T {
+    // Create a comptime string map for the enum fields
+    const enum_fields = @typeInfo(T).Enum.fields;
+    comptime var kvs_list: [enum_fields.len]struct { []const u8, T } = undefined;
+    inline for (enum_fields, 0..) |field, i| {
+        kvs_list[i] = .{ field.name, @intToEnum(T, field.value) };
+    }
+    const tags = std.ComptimeStringMap(T, kvs_list);
+
+    // TODO: could technically optimize getter for the case where it doesn't fail
+    // TODO: the optimizer is smart enough to move the getters into the orelse case for these sorts
+    // of things right?
+    // Get the tag if it exists
+    const main_tokens = self.ast.nodes.items(.main_token);
+    const data = self.ast.nodes.items(.data);
+    const token = main_tokens[node];
+    const bytes = self.ast.tokenSlice(token);
+    // TODO: unclear to me if I'm getting the dot location correctly
+    const dot_node = data[node].lhs;
+    const dot_token = main_tokens[dot_node];
+    return tags.get(bytes) orelse
+        self.failCannotRepresent(T, dot_token);
+}
+
+test "enum literals" {
+    const allocator = std.testing.allocator;
+
+    const Enum = enum {
+        foo,
+        bar,
+        baz,
+    };
+
+    // Tags that exist
+    try std.testing.expectEqual(Enum.foo, try parseThenFree(allocator, Enum, ".foo"));
+    try std.testing.expectEqual(Enum.bar, try parseThenFree(allocator, Enum, ".bar"));
+    try std.testing.expectEqual(Enum.baz, try parseThenFree(allocator, Enum, ".baz"));
+
+    // Bad tag
+    {
+        var result = try parse(allocator, Enum, ".qux");
+        defer result.deinit(allocator);
+        try std.testing.expect(std.mem.eql(u8, result.value.type_error.cannot_represent.name, @typeName(Enum)));
+        const location = result.ast.tokenLocation(0, result.value.type_error.cannot_represent.token);
+        try std.testing.expectEqual(Ast.Location{
+            .line = 0,
+            .column = 0,
+            .line_start = 0,
+            .line_end = 4,
+        }, location);
+    }
+
+    // Bad type
+    {
+        var result = try parse(allocator, Enum, "true");
+        defer result.deinit(allocator);
+        try std.testing.expect(std.mem.eql(u8, result.value.type_error.expected_type.name, @typeName(Enum)));
+        const location = result.ast.tokenLocation(0, result.value.type_error.expected_type.token);
+        try std.testing.expectEqual(Ast.Location{
+            .line = 0,
+            .column = 0,
+            .line_start = 0,
+            .line_end = 4,
+        }, location);
+    }
+}
+
+test "numeric enum literals" {
+    const allocator = std.testing.allocator;
+
+    const Enum = enum(u8) {
+        zero,
+        three = 3,
+    };
+
+    const SignedEnum = enum(i8) {
+        zero,
+        three = -3,
+    };
+
+    // Test parsing numbers as enums
+    try std.testing.expectEqual(Enum.zero, try parseThenFree(allocator, Enum, "0"));
+    try std.testing.expectEqual(Enum.three, try parseThenFree(allocator, Enum, "3"));
+    try std.testing.expectEqual(SignedEnum.zero, try parseThenFree(allocator, SignedEnum, "0"));
+    try std.testing.expectEqual(SignedEnum.three, try parseThenFree(allocator, SignedEnum, "-3"));
+
+    // Bad tag
+    {
+        var result = try parse(allocator, Enum, "2");
+        defer result.deinit(allocator);
+        try std.testing.expect(std.mem.eql(u8, result.value.type_error.cannot_represent.name, @typeName(Enum)));
+        const location = result.ast.tokenLocation(0, result.value.type_error.cannot_represent.token);
+        try std.testing.expectEqual(Ast.Location{
+            .line = 0,
+            .column = 0,
+            .line_start = 0,
+            .line_end = 1,
+        }, location);
+    }
+
+    // Out of range tag
+    {
+        var result = try parse(allocator, Enum, "256");
+        defer result.deinit(allocator);
+        try std.testing.expect(std.mem.eql(u8, result.value.type_error.cannot_represent.name, @typeName(Enum)));
+        const location = result.ast.tokenLocation(0, result.value.type_error.cannot_represent.token);
+        try std.testing.expectEqual(Ast.Location{
+            .line = 0,
+            .column = 0,
+            .line_start = 0,
+            .line_end = 3,
+        }, location);
+    }
+
+    // Unexpected negative tag
+    {
+        var result = try parse(allocator, Enum, "-3");
+        defer result.deinit(allocator);
+        try std.testing.expect(std.mem.eql(u8, result.value.type_error.cannot_represent.name, @typeName(Enum)));
+        const location = result.ast.tokenLocation(0, result.value.type_error.cannot_represent.token);
+        try std.testing.expectEqual(Ast.Location{
+            .line = 0,
+            .column = 0,
+            .line_start = 0,
+            .line_end = 2,
+        }, location);
+    }
+
+    // Float tag
+    {
+        var result = try parse(allocator, Enum, "1.5");
+        defer result.deinit(allocator);
+        try std.testing.expect(std.mem.eql(u8, result.value.type_error.cannot_represent.name, @typeName(Enum)));
+        const location = result.ast.tokenLocation(0, result.value.type_error.cannot_represent.token);
+        try std.testing.expectEqual(Ast.Location{
+            .line = 0,
+            .column = 0,
+            .line_start = 0,
+            .line_end = 3,
+        }, location);
+    }
+
+    // TODO: name general purpose allocators gpa!
+}
+
+// XXX: why take token instead of node again for these?
 fn fail(self: *Parser, err: Error) error{Type} {
     @setCold(true);
-    assert(self.err == null);
+    // XXX: ...
+    // assert(self.err == null);
     self.err = err;
     return error.Type;
 }
@@ -291,9 +460,7 @@ fn parseFloat(
         .Int => f128,
         else => unreachable,
     };
-    // const data = self.ast.nodes.items(.data);
-    const bytes_node = node; //if (neg_token != null) node else data[node].lhs;
-    const bytes = self.ast.tokenSlice(bytes_node);
+    const bytes = self.ast.tokenSlice(node);
     const unsigned_float = std.fmt.parseFloat(Float, bytes) catch unreachable;
     const result = if (neg_token != null) -unsigned_float else unsigned_float;
     if (T == Float) {
