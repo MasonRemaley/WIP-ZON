@@ -17,11 +17,11 @@ err: ?Error = null,
 pub const Error = union(enum) {
     expected_type: struct {
         name: []const u8,
-        token: TokenIndex,
+        node: NodeIndex,
     },
     cannot_represent: struct {
         name: []const u8,
-        token: TokenIndex,
+        node: NodeIndex,
     },
 };
 
@@ -60,6 +60,7 @@ pub fn parse(allocator: Allocator, comptime T: type, source: [:0]const u8) Alloc
     };
 
     const data = ast.nodes.items(.data);
+    // TODO: why lhs here?
     const root = data[0].lhs;
     const success = parser.parseValue(T, root) catch |err| switch (err) {
         error.Type => return .{
@@ -83,25 +84,22 @@ pub fn parseValue(self: *Parser, comptime T: type, node: NodeIndex) error{Type}!
     }
 }
 
+// TODO: cannot represent not quite right error for unknown field right?
 fn parseEnumLiteral(self: *Parser, comptime T: type, node: NodeIndex) error{Type}!T {
     const tags = self.ast.nodes.items(.tag);
-    const main_tokens = self.ast.nodes.items(.main_token);
-    const token = main_tokens[node];
     return switch (tags[node]) {
         .enum_literal => try self.parseEnumTag(T, node),
         .number_literal, .negation => try self.parseEnumNumber(T, node),
-        else => return self.failExpectedType(T, token),
+        else => return self.failExpectedType(T, node),
     };
 }
 
 fn parseEnumNumber(self: *Parser, comptime T: type, node: NodeIndex) error{Type}!T {
-    const main_tokens = self.ast.nodes.items(.main_token);
-    const token = main_tokens[node];
     // XXX: kinda weird dup error handling?
     var number = self.parseNumber(@typeInfo(T).Enum.tag_type, node) catch
-        return self.failCannotRepresent(T, token);
+        return self.failCannotRepresent(T, node);
     return std.meta.intToEnum(T, number) catch
-        self.failCannotRepresent(T, token);
+        self.failCannotRepresent(T, node);
 }
 
 fn parseEnumTag(self: *Parser, comptime T: type, node: NodeIndex) error{Type}!T {
@@ -117,15 +115,13 @@ fn parseEnumTag(self: *Parser, comptime T: type, node: NodeIndex) error{Type}!T 
     // TODO: the optimizer is smart enough to move the getters into the orelse case for these sorts
     // of things right?
     // Get the tag if it exists
-    const main_tokens = self.ast.nodes.items(.main_token);
+    const tokens = self.ast.nodes.items(.main_token);
     const data = self.ast.nodes.items(.data);
-    const token = main_tokens[node];
+    const token = tokens[node];
     const bytes = self.ast.tokenSlice(token);
-    // TODO: unclear to me if I'm getting the dot location correctly
     const dot_node = data[node].lhs;
-    const dot_token = main_tokens[dot_node];
     return tags.get(bytes) orelse
-        self.failCannotRepresent(T, dot_token);
+        self.failCannotRepresent(T, dot_node);
 }
 
 test "enum literals" {
@@ -147,7 +143,10 @@ test "enum literals" {
         var result = try parse(allocator, Enum, ".qux");
         defer result.deinit(allocator);
         try std.testing.expect(std.mem.eql(u8, result.value.type_error.cannot_represent.name, @typeName(Enum)));
-        const location = result.ast.tokenLocation(0, result.value.type_error.cannot_represent.token);
+        const node = result.value.type_error.cannot_represent.node;
+        const tokens = result.ast.nodes.items(.main_token);
+        const token = tokens[node];
+        const location = result.ast.tokenLocation(0, token);
         try std.testing.expectEqual(Ast.Location{
             .line = 0,
             .column = 0,
@@ -161,7 +160,10 @@ test "enum literals" {
         var result = try parse(allocator, Enum, "true");
         defer result.deinit(allocator);
         try std.testing.expect(std.mem.eql(u8, result.value.type_error.expected_type.name, @typeName(Enum)));
-        const location = result.ast.tokenLocation(0, result.value.type_error.expected_type.token);
+        const node = result.value.type_error.expected_type.node;
+        const tokens = result.ast.nodes.items(.main_token);
+        const token = tokens[node];
+        const location = result.ast.tokenLocation(0, token);
         try std.testing.expectEqual(Ast.Location{
             .line = 0,
             .column = 0,
@@ -195,7 +197,10 @@ test "numeric enum literals" {
         var result = try parse(allocator, Enum, "2");
         defer result.deinit(allocator);
         try std.testing.expect(std.mem.eql(u8, result.value.type_error.cannot_represent.name, @typeName(Enum)));
-        const location = result.ast.tokenLocation(0, result.value.type_error.cannot_represent.token);
+        const node = result.value.type_error.cannot_represent.node;
+        const tokens = result.ast.nodes.items(.main_token);
+        const token = tokens[node];
+        const location = result.ast.tokenLocation(0, token);
         try std.testing.expectEqual(Ast.Location{
             .line = 0,
             .column = 0,
@@ -209,7 +214,10 @@ test "numeric enum literals" {
         var result = try parse(allocator, Enum, "256");
         defer result.deinit(allocator);
         try std.testing.expect(std.mem.eql(u8, result.value.type_error.cannot_represent.name, @typeName(Enum)));
-        const location = result.ast.tokenLocation(0, result.value.type_error.cannot_represent.token);
+        const node = result.value.type_error.cannot_represent.node;
+        const tokens = result.ast.nodes.items(.main_token);
+        const token = tokens[node];
+        const location = result.ast.tokenLocation(0, token);
         try std.testing.expectEqual(Ast.Location{
             .line = 0,
             .column = 0,
@@ -223,7 +231,10 @@ test "numeric enum literals" {
         var result = try parse(allocator, Enum, "-3");
         defer result.deinit(allocator);
         try std.testing.expect(std.mem.eql(u8, result.value.type_error.cannot_represent.name, @typeName(Enum)));
-        const location = result.ast.tokenLocation(0, result.value.type_error.cannot_represent.token);
+        const node = result.value.type_error.cannot_represent.node;
+        const tokens = result.ast.nodes.items(.main_token);
+        const token = tokens[node];
+        const location = result.ast.tokenLocation(0, token);
         try std.testing.expectEqual(Ast.Location{
             .line = 0,
             .column = 0,
@@ -237,7 +248,10 @@ test "numeric enum literals" {
         var result = try parse(allocator, Enum, "1.5");
         defer result.deinit(allocator);
         try std.testing.expect(std.mem.eql(u8, result.value.type_error.cannot_represent.name, @typeName(Enum)));
-        const location = result.ast.tokenLocation(0, result.value.type_error.cannot_represent.token);
+        const node = result.value.type_error.cannot_represent.node;
+        const tokens = result.ast.nodes.items(.main_token);
+        const token = tokens[node];
+        const location = result.ast.tokenLocation(0, token);
         try std.testing.expectEqual(Ast.Location{
             .line = 0,
             .column = 0,
@@ -249,28 +263,27 @@ test "numeric enum literals" {
     // TODO: name general purpose allocators gpa!
 }
 
-// XXX: why take token instead of node again for these?
 fn fail(self: *Parser, err: Error) error{Type} {
     @setCold(true);
-    // XXX: ...
+    // XXX: ...commented out cause of dup error handling
     // assert(self.err == null);
     self.err = err;
     return error.Type;
 }
 
-fn failExpectedType(self: *Parser, comptime T: type, token: TokenIndex) error{Type} {
+fn failExpectedType(self: *Parser, comptime T: type, node: NodeIndex) error{Type} {
     @setCold(true);
     return self.fail(.{ .expected_type = .{
         .name = @typeName(T),
-        .token = token,
+        .node = node,
     } });
 }
 
-fn failCannotRepresent(self: *Parser, comptime T: type, token: TokenIndex) error{Type} {
+fn failCannotRepresent(self: *Parser, comptime T: type, node: NodeIndex) error{Type} {
     @setCold(true);
     return self.fail(.{ .cannot_represent = .{
         .name = @typeName(T),
-        .token = token,
+        .node = node,
     } });
 }
 
@@ -286,11 +299,11 @@ fn parseThenFree(allocator: Allocator, comptime T: type, source: [:0]const u8) !
 
 fn parseBool(self: *Parser, node: NodeIndex) error{Type}!bool {
     const tags = self.ast.nodes.items(.tag);
-    const main_tokens = self.ast.nodes.items(.main_token);
-    const ident_token = main_tokens[node];
+    const tokens = self.ast.nodes.items(.main_token);
+    const token = tokens[node];
     switch (tags[node]) {
         .identifier => {
-            const bytes = self.ast.tokenSlice(ident_token);
+            const bytes = self.ast.tokenSlice(token);
             if (std.mem.eql(u8, bytes, "true")) {
                 return true;
             } else if (std.mem.eql(u8, bytes, "false")) {
@@ -299,7 +312,7 @@ fn parseBool(self: *Parser, node: NodeIndex) error{Type}!bool {
         },
         else => {},
     }
-    return self.failExpectedType(bool, ident_token);
+    return self.failExpectedType(bool, node);
 }
 
 test "parse bool" {
@@ -315,7 +328,10 @@ test "parse bool" {
         var result = try parse(allocator, bool, " foo");
         defer result.deinit(allocator);
         try std.testing.expect(std.mem.eql(u8, result.value.type_error.expected_type.name, @typeName(bool)));
-        const location = result.ast.tokenLocation(0, result.value.type_error.expected_type.token);
+        const node = result.value.type_error.expected_type.node;
+        const tokens = result.ast.nodes.items(.main_token);
+        const token = tokens[node];
+        const location = result.ast.tokenLocation(0, token);
         try std.testing.expectEqual(Ast.Location{
             .line = 0,
             .column = 1,
@@ -327,7 +343,10 @@ test "parse bool" {
         var result = try parse(allocator, bool, "123");
         defer result.deinit(allocator);
         try std.testing.expect(std.mem.eql(u8, result.value.type_error.expected_type.name, @typeName(bool)));
-        const location = result.ast.tokenLocation(0, result.value.type_error.expected_type.token);
+        const node = result.value.type_error.expected_type.node;
+        const tokens = result.ast.nodes.items(.main_token);
+        const token = tokens[node];
+        const location = result.ast.tokenLocation(0, token);
         try std.testing.expectEqual(Ast.Location{
             .line = 0,
             .column = 0,
@@ -337,53 +356,38 @@ test "parse bool" {
     }
 }
 
-fn parseNumber(self: *Parser, comptime T: type, node: NodeIndex) error{Type}!T {
-    const tags = self.ast.nodes.items(.tag);
-    const data = self.ast.nodes.items(.data);
-    const main_tokens = self.ast.nodes.items(.main_token);
-    return switch (tags[node]) {
-        .negation => try self.parseNumberWithSign(T, data[node].lhs, main_tokens[node]),
-        else => try self.parseNumberWithSign(T, node, null),
-    };
-}
-
-fn parseNumberWithSign(
+// TODO: could set unused lhs/rhs to undefined?
+fn parseNumber(
     self: *Parser,
     comptime T: type,
     node: NodeIndex,
-    neg_token: ?TokenIndex,
 ) error{Type}!T {
+    const num_lit_node = self.numLitNode(node);
     const tags = self.ast.nodes.items(.tag);
-    switch (tags[node]) {
-        .number_literal => return self.parseNumberLiteral(T, node, neg_token),
-        .char_literal => return self.parseCharLiteral(T, node, neg_token),
-        else => {
-            const main_tokens = self.ast.nodes.items(.main_token);
-            const token = main_tokens[node];
-            return self.failExpectedType(T, token);
-        },
+    switch (tags[num_lit_node]) {
+        .number_literal => return self.parseNumberLiteral(T, node),
+        .char_literal => return self.parseCharLiteral(T, node),
+        else => return self.failExpectedType(T, num_lit_node),
     }
 }
 
-fn parseNumberLiteral(self: *Parser, comptime T: type, node: NodeIndex, neg_token: ?TokenIndex) error{Type}!T {
-    const main_tokens = self.ast.nodes.items(.main_token);
-    const num_lit_token = main_tokens[node];
+fn parseNumberLiteral(self: *Parser, comptime T: type, node: NodeIndex) error{Type}!T {
+    const num_lit_node = self.numLitNode(node);
+    const tokens = self.ast.nodes.items(.main_token);
+    const num_lit_token = tokens[num_lit_node];
     const token_bytes = self.ast.tokenSlice(num_lit_token);
     const number = std.zig.number_literal.parseNumberLiteral(token_bytes);
 
-    const data = self.ast.nodes.items(.data);
-    const bytes_node = if (neg_token != null) node else data[node].lhs;
-
     switch (number) {
-        .int => |int| return self.applySignToInt(T, neg_token orelse num_lit_token, neg_token != null, int),
-        .big_int => |base| return self.parseBigNumber(T, neg_token, bytes_node, base),
-        .float => return self.parseFloat(T, neg_token, bytes_node),
+        .int => |int| return self.applySignToInt(T, node, int),
+        .big_int => |base| return self.parseBigNumber(T, node, base),
+        .float => return self.parseFloat(T, node),
         else => unreachable,
     }
 }
 
-fn applySignToInt(self: *Parser, comptime T: type, token: TokenIndex, negative: bool, int: anytype) error{Type}!T {
-    if (negative) {
+fn applySignToInt(self: *Parser, comptime T: type, node: NodeIndex, int: anytype) error{Type}!T {
+    if (self.isNegative(node)) {
         switch (@typeInfo(T)) {
             .Int => |int_type| switch (int_type.signedness) {
                 .signed => {
@@ -392,12 +396,12 @@ fn applySignToInt(self: *Parser, comptime T: type, token: TokenIndex, negative: 
                         .signedness = .signed,
                     } });
                     if (int > std.math.maxInt(T) + 1) {
-                        return self.failCannotRepresent(T, token);
+                        return self.failCannotRepresent(T, node);
                     }
                     const positive = @intCast(Positive, int);
                     return @intCast(T, -positive);
                 },
-                .unsigned => return self.failCannotRepresent(T, token),
+                .unsigned => return self.failCannotRepresent(T, node),
             },
             .Float => return -@intToFloat(T, int),
             else => @compileError("expected numeric type"),
@@ -405,7 +409,7 @@ fn applySignToInt(self: *Parser, comptime T: type, token: TokenIndex, negative: 
     } else {
         switch (@typeInfo(T)) {
             .Int => return std.math.cast(T, int) orelse
-                self.failCannotRepresent(T, token),
+                self.failCannotRepresent(T, node),
             .Float => return @intToFloat(T, int),
             else => @compileError("expected numeric type"),
         }
@@ -415,35 +419,36 @@ fn applySignToInt(self: *Parser, comptime T: type, token: TokenIndex, negative: 
 fn parseBigNumber(
     self: *Parser,
     comptime T: type,
-    neg_token: ?TokenIndex,
     node: NodeIndex,
     base: Base,
 ) error{Type}!T {
     switch (@typeInfo(T)) {
-        .Int => return self.parseBigInt(T, neg_token, node, base),
+        .Int => return self.parseBigInt(T, node, base),
         // TODO: passing in f128 to work around possible float parsing bug
-        .Float => return @floatCast(T, try self.parseFloat(f128, neg_token, node)),
+        .Float => return @floatCast(T, try self.parseFloat(f128, node)),
         else => unreachable,
     }
 }
 
-fn parseBigInt(self: *Parser, comptime T: type, neg_token: ?TokenIndex, node: NodeIndex, base: Base) error{Type}!T {
-    const main_tokens = self.ast.nodes.items(.main_token);
-    const token = neg_token orelse main_tokens[node];
-    const bytes = self.ast.tokenSlice(node);
+fn parseBigInt(self: *Parser, comptime T: type, node: NodeIndex, base: Base) error{Type}!T {
+    const num_lit_node = self.numLitNode(node);
+    const tokens = self.ast.nodes.items(.main_token);
+    const num_lit_token = tokens[num_lit_node];
+    // TODO: was wrong, passed in node by mistake! we could edit the ast to make this stuff typesafe..?
+    const bytes = self.ast.tokenSlice(num_lit_token);
     const prefix_offset = @as(u8, 2) * @boolToInt(base != .decimal);
     var result: T = 0;
     for (bytes[prefix_offset..]) |char| {
         if (char == '_') continue;
         const d = std.fmt.charToDigit(char, @enumToInt(base)) catch unreachable;
         result = std.math.mul(T, result, @intCast(T, @enumToInt(base))) catch
-            return self.failCannotRepresent(T, token);
-        if (neg_token != null) {
+            return self.failCannotRepresent(T, node);
+        if (self.isNegative(node)) {
             result = std.math.sub(T, result, @intCast(T, d)) catch
-                return self.failCannotRepresent(T, token);
+                return self.failCannotRepresent(T, node);
         } else {
             result = std.math.add(T, result, @intCast(T, d)) catch
-                return self.failCannotRepresent(T, token);
+                return self.failCannotRepresent(T, node);
         }
     }
     return result;
@@ -452,7 +457,6 @@ fn parseBigInt(self: *Parser, comptime T: type, neg_token: ?TokenIndex, node: No
 fn parseFloat(
     self: *Parser,
     comptime T: type,
-    neg_token: ?TokenIndex,
     node: NodeIndex,
 ) error{Type}!T {
     const Float = switch (@typeInfo(T)) {
@@ -460,25 +464,43 @@ fn parseFloat(
         .Int => f128,
         else => unreachable,
     };
-    const bytes = self.ast.tokenSlice(node);
+    const num_lit_node = self.numLitNode(node);
+    const tokens = self.ast.nodes.items(.main_token);
+    const num_lit_token = tokens[num_lit_node];
+    const bytes = self.ast.tokenSlice(num_lit_token);
     const unsigned_float = std.fmt.parseFloat(Float, bytes) catch unreachable;
-    const result = if (neg_token != null) -unsigned_float else unsigned_float;
+    const result = if (self.isNegative(node)) -unsigned_float else unsigned_float;
     if (T == Float) {
         return result;
     } else {
-        const main_tokens = self.ast.nodes.items(.main_token);
-        const token = neg_token orelse main_tokens[node];
         return floatToInt(T, result) orelse
-            self.failCannotRepresent(T, token);
+            self.failCannotRepresent(T, node);
     }
 }
 
-fn parseCharLiteral(self: *Parser, comptime T: type, node: NodeIndex, neg_token: ?TokenIndex) error{Type}!T {
-    const main_tokens = self.ast.nodes.items(.main_token);
-    const num_lit_token = main_tokens[node];
+fn parseCharLiteral(self: *Parser, comptime T: type, node: NodeIndex) error{Type}!T {
+    const num_lit_node = self.numLitNode(node);
+    const tokens = self.ast.nodes.items(.main_token);
+    const num_lit_token = tokens[num_lit_node];
     const token_bytes = self.ast.tokenSlice(num_lit_token);
     const char = std.zig.string_literal.parseCharLiteral(token_bytes).success;
-    return self.applySignToInt(T, neg_token orelse num_lit_token, neg_token != null, char);
+    return self.applySignToInt(T, node, char);
+}
+
+// TODO: technically I can cache the results of this and numLitNode, but it's confusing. could maybe
+// wrap in a struct that's like main node, negative node? or something.
+fn isNegative(self: *const Parser, node: NodeIndex) bool {
+    const tags = self.ast.nodes.items(.tag);
+    return tags[node] == .negation;
+}
+
+fn numLitNode(self: *const Parser, node: NodeIndex) NodeIndex {
+    if (self.isNegative(node)) {
+        const data = self.ast.nodes.items(.data);
+        return data[node].lhs;
+    } else {
+        return node;
+    }
 }
 
 // TODO: move to std.math?
@@ -574,7 +596,10 @@ test "parse int" {
         var result = try parse(allocator, i66, "36893488147419103232");
         defer result.deinit(allocator);
         try std.testing.expect(std.mem.eql(u8, result.value.type_error.cannot_represent.name, @typeName(i66)));
-        const location = result.ast.tokenLocation(0, result.value.type_error.cannot_represent.token);
+        const node = result.value.type_error.cannot_represent.node;
+        const tokens = result.ast.nodes.items(.main_token);
+        const token = tokens[node];
+        const location = result.ast.tokenLocation(0, token);
         try std.testing.expectEqual(Ast.Location{
             .line = 0,
             .column = 0,
@@ -586,7 +611,10 @@ test "parse int" {
         var result = try parse(allocator, i66, "-36893488147419103233");
         defer result.deinit(allocator);
         try std.testing.expect(std.mem.eql(u8, result.value.type_error.cannot_represent.name, @typeName(i66)));
-        const location = result.ast.tokenLocation(0, result.value.type_error.cannot_represent.token);
+        const node = result.value.type_error.cannot_represent.node;
+        const tokens = result.ast.nodes.items(.main_token);
+        const token = tokens[node];
+        const location = result.ast.tokenLocation(0, token);
         try std.testing.expectEqual(Ast.Location{
             .line = 0,
             .column = 0,
@@ -659,7 +687,10 @@ test "parse int" {
         var result = try parse(allocator, u8, "true");
         defer result.deinit(allocator);
         try std.testing.expect(std.mem.eql(u8, result.value.type_error.expected_type.name, @typeName(u8)));
-        const location = result.ast.tokenLocation(0, result.value.type_error.expected_type.token);
+        const node = result.value.type_error.expected_type.node;
+        const tokens = result.ast.nodes.items(.main_token);
+        const token = tokens[node];
+        const location = result.ast.tokenLocation(0, token);
         try std.testing.expectEqual(Ast.Location{
             .line = 0,
             .column = 0,
@@ -673,7 +704,10 @@ test "parse int" {
         var result = try parse(allocator, u8, "256");
         defer result.deinit(allocator);
         try std.testing.expect(std.mem.eql(u8, result.value.type_error.cannot_represent.name, @typeName(u8)));
-        const location = result.ast.tokenLocation(0, result.value.type_error.cannot_represent.token);
+        const node = result.value.type_error.cannot_represent.node;
+        const tokens = result.ast.nodes.items(.main_token);
+        const token = tokens[node];
+        const location = result.ast.tokenLocation(0, token);
         try std.testing.expectEqual(Ast.Location{
             .line = 0,
             .column = 0,
@@ -687,7 +721,10 @@ test "parse int" {
         var result = try parse(allocator, i8, "-129");
         defer result.deinit(allocator);
         try std.testing.expect(std.mem.eql(u8, result.value.type_error.cannot_represent.name, @typeName(i8)));
-        const location = result.ast.tokenLocation(0, result.value.type_error.cannot_represent.token);
+        const node = result.value.type_error.cannot_represent.node;
+        const tokens = result.ast.nodes.items(.main_token);
+        const token = tokens[node];
+        const location = result.ast.tokenLocation(0, token);
         try std.testing.expectEqual(Ast.Location{
             .line = 0,
             .column = 0,
@@ -701,7 +738,10 @@ test "parse int" {
         var result = try parse(allocator, u8, "-1");
         defer result.deinit(allocator);
         try std.testing.expect(std.mem.eql(u8, result.value.type_error.cannot_represent.name, @typeName(u8)));
-        const location = result.ast.tokenLocation(0, result.value.type_error.cannot_represent.token);
+        const node = result.value.type_error.cannot_represent.node;
+        const tokens = result.ast.nodes.items(.main_token);
+        const token = tokens[node];
+        const location = result.ast.tokenLocation(0, token);
         try std.testing.expectEqual(Ast.Location{
             .line = 0,
             .column = 0,
@@ -715,7 +755,10 @@ test "parse int" {
         var result = try parse(allocator, u8, "1.5");
         defer result.deinit(allocator);
         try std.testing.expect(std.mem.eql(u8, result.value.type_error.cannot_represent.name, @typeName(u8)));
-        const location = result.ast.tokenLocation(0, result.value.type_error.cannot_represent.token);
+        const node = result.value.type_error.cannot_represent.node;
+        const tokens = result.ast.nodes.items(.main_token);
+        const token = tokens[node];
+        const location = result.ast.tokenLocation(0, token);
         try std.testing.expectEqual(Ast.Location{
             .line = 0,
             .column = 0,
@@ -729,7 +772,10 @@ test "parse int" {
         var result = try parse(allocator, u8, "-1.0");
         defer result.deinit(allocator);
         try std.testing.expect(std.mem.eql(u8, result.value.type_error.cannot_represent.name, @typeName(u8)));
-        const location = result.ast.tokenLocation(0, result.value.type_error.cannot_represent.token);
+        const node = result.value.type_error.cannot_represent.node;
+        const tokens = result.ast.nodes.items(.main_token);
+        const token = tokens[node];
+        const location = result.ast.tokenLocation(0, token);
         try std.testing.expectEqual(Ast.Location{
             .line = 0,
             .column = 0,
