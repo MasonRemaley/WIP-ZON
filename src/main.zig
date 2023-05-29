@@ -11,7 +11,7 @@ const assert = std.debug.assert;
 const Parser = @This();
 
 allocator: Allocator,
-ast: Ast,
+ast: *const Ast,
 err: ?Error = null,
 
 pub const Error = union(enum) {
@@ -26,53 +26,43 @@ pub const Error = union(enum) {
 };
 
 pub fn Result(comptime T: type) type {
-    return struct {
-        value: union(enum) {
-            success: T,
-            type_error: Error,
-            parse_error,
-        },
-        ast: Ast,
+    // TODO: make a render errors function...
+    return union(enum) {
+        success: T,
+        err: Error,
 
-        fn deinit(self: *@This(), allocator: Allocator) void {
-            self.ast.deinit(allocator);
+        // TODO: unimplemented...
+        fn deinit(self: *@This(), _: Allocator) void {
             self.* = undefined;
         }
-
-        // TODO: make a render errors function...
     };
 }
 
-pub fn parse(allocator: Allocator, comptime T: type, source: [:0]const u8) Allocator.Error!Result(T) {
-    var ast = try std.zig.Ast.parse(allocator, source, .zon);
-    errdefer ast.deinit(allocator);
-
-    if (ast.errors.len != 0) {
-        return .{
-            .value = .parse_error,
-            .ast = ast,
-        };
-    }
-
+pub fn parse(allocator: Allocator, comptime T: type, ast: *const Ast) Allocator.Error!Result(T) {
     var parser = Parser{
         .allocator = allocator,
         .ast = ast,
     };
-
     const data = ast.nodes.items(.data);
     // TODO: why lhs here?
     const root = data[0].lhs;
     const success = parser.parseValue(T, root) catch |err| switch (err) {
-        error.Type => return .{
-            .value = .{ .type_error = parser.err.? },
-            .ast = ast,
-        },
+        error.Type => return .{ .err = parser.err.? },
     };
 
-    return .{
-        .value = .{ .success = success },
-        .ast = ast,
-    };
+    return .{ .success = success };
+}
+
+fn testParseFree(allocator: Allocator, comptime T: type, source: [:0]const u8) error{ OutOfMemory, Type }!T {
+    var ast = try std.zig.Ast.parse(allocator, source, .zon);
+    defer ast.deinit(allocator);
+    assert(ast.errors.len == 0);
+    var result = try parse(allocator, T, &ast);
+    defer result.deinit(allocator);
+    switch (result) {
+        .err => return error.Type,
+        .success => |success| return success,
+    }
 }
 
 pub fn parseValue(self: *Parser, comptime T: type, node: NodeIndex) error{Type}!T {
@@ -134,19 +124,21 @@ test "enum literals" {
     };
 
     // Tags that exist
-    try std.testing.expectEqual(Enum.foo, try parseThenFree(allocator, Enum, ".foo"));
-    try std.testing.expectEqual(Enum.bar, try parseThenFree(allocator, Enum, ".bar"));
-    try std.testing.expectEqual(Enum.baz, try parseThenFree(allocator, Enum, ".baz"));
+    try std.testing.expectEqual(Enum.foo, try testParseFree(allocator, Enum, ".foo"));
+    try std.testing.expectEqual(Enum.bar, try testParseFree(allocator, Enum, ".bar"));
+    try std.testing.expectEqual(Enum.baz, try testParseFree(allocator, Enum, ".baz"));
 
     // Bad tag
     {
-        var result = try parse(allocator, Enum, ".qux");
+        var ast = try std.zig.Ast.parse(allocator, ".qux", .zon);
+        defer ast.deinit(allocator);
+        var result = try parse(allocator, Enum, &ast);
         defer result.deinit(allocator);
-        try std.testing.expect(std.mem.eql(u8, result.value.type_error.cannot_represent.name, @typeName(Enum)));
-        const node = result.value.type_error.cannot_represent.node;
-        const tokens = result.ast.nodes.items(.main_token);
+        try std.testing.expect(std.mem.eql(u8, result.err.cannot_represent.name, @typeName(Enum)));
+        const node = result.err.cannot_represent.node;
+        const tokens = ast.nodes.items(.main_token);
         const token = tokens[node];
-        const location = result.ast.tokenLocation(0, token);
+        const location = ast.tokenLocation(0, token);
         try std.testing.expectEqual(Ast.Location{
             .line = 0,
             .column = 0,
@@ -157,13 +149,15 @@ test "enum literals" {
 
     // Bad type
     {
-        var result = try parse(allocator, Enum, "true");
+        var ast = try std.zig.Ast.parse(allocator, "true", .zon);
+        defer ast.deinit(allocator);
+        var result = try parse(allocator, Enum, &ast);
         defer result.deinit(allocator);
-        try std.testing.expect(std.mem.eql(u8, result.value.type_error.expected_type.name, @typeName(Enum)));
-        const node = result.value.type_error.expected_type.node;
-        const tokens = result.ast.nodes.items(.main_token);
+        try std.testing.expect(std.mem.eql(u8, result.err.expected_type.name, @typeName(Enum)));
+        const node = result.err.expected_type.node;
+        const tokens = ast.nodes.items(.main_token);
         const token = tokens[node];
-        const location = result.ast.tokenLocation(0, token);
+        const location = ast.tokenLocation(0, token);
         try std.testing.expectEqual(Ast.Location{
             .line = 0,
             .column = 0,
@@ -187,20 +181,22 @@ test "numeric enum literals" {
     };
 
     // Test parsing numbers as enums
-    try std.testing.expectEqual(Enum.zero, try parseThenFree(allocator, Enum, "0"));
-    try std.testing.expectEqual(Enum.three, try parseThenFree(allocator, Enum, "3"));
-    try std.testing.expectEqual(SignedEnum.zero, try parseThenFree(allocator, SignedEnum, "0"));
-    try std.testing.expectEqual(SignedEnum.three, try parseThenFree(allocator, SignedEnum, "-3"));
+    try std.testing.expectEqual(Enum.zero, try testParseFree(allocator, Enum, "0"));
+    try std.testing.expectEqual(Enum.three, try testParseFree(allocator, Enum, "3"));
+    try std.testing.expectEqual(SignedEnum.zero, try testParseFree(allocator, SignedEnum, "0"));
+    try std.testing.expectEqual(SignedEnum.three, try testParseFree(allocator, SignedEnum, "-3"));
 
     // Bad tag
     {
-        var result = try parse(allocator, Enum, "2");
+        var ast = try std.zig.Ast.parse(allocator, "2", .zon);
+        defer ast.deinit(allocator);
+        var result = try parse(allocator, Enum, &ast);
         defer result.deinit(allocator);
-        try std.testing.expect(std.mem.eql(u8, result.value.type_error.cannot_represent.name, @typeName(Enum)));
-        const node = result.value.type_error.cannot_represent.node;
-        const tokens = result.ast.nodes.items(.main_token);
+        try std.testing.expect(std.mem.eql(u8, result.err.cannot_represent.name, @typeName(Enum)));
+        const node = result.err.cannot_represent.node;
+        const tokens = ast.nodes.items(.main_token);
         const token = tokens[node];
-        const location = result.ast.tokenLocation(0, token);
+        const location = ast.tokenLocation(0, token);
         try std.testing.expectEqual(Ast.Location{
             .line = 0,
             .column = 0,
@@ -211,13 +207,15 @@ test "numeric enum literals" {
 
     // Out of range tag
     {
-        var result = try parse(allocator, Enum, "256");
+        var ast = try std.zig.Ast.parse(allocator, "256", .zon);
+        defer ast.deinit(allocator);
+        var result = try parse(allocator, Enum, &ast);
         defer result.deinit(allocator);
-        try std.testing.expect(std.mem.eql(u8, result.value.type_error.cannot_represent.name, @typeName(Enum)));
-        const node = result.value.type_error.cannot_represent.node;
-        const tokens = result.ast.nodes.items(.main_token);
+        try std.testing.expect(std.mem.eql(u8, result.err.cannot_represent.name, @typeName(Enum)));
+        const node = result.err.cannot_represent.node;
+        const tokens = ast.nodes.items(.main_token);
         const token = tokens[node];
-        const location = result.ast.tokenLocation(0, token);
+        const location = ast.tokenLocation(0, token);
         try std.testing.expectEqual(Ast.Location{
             .line = 0,
             .column = 0,
@@ -228,13 +226,15 @@ test "numeric enum literals" {
 
     // Unexpected negative tag
     {
-        var result = try parse(allocator, Enum, "-3");
+        var ast = try std.zig.Ast.parse(allocator, "-3", .zon);
+        defer ast.deinit(allocator);
+        var result = try parse(allocator, Enum, &ast);
         defer result.deinit(allocator);
-        try std.testing.expect(std.mem.eql(u8, result.value.type_error.cannot_represent.name, @typeName(Enum)));
-        const node = result.value.type_error.cannot_represent.node;
-        const tokens = result.ast.nodes.items(.main_token);
+        try std.testing.expect(std.mem.eql(u8, result.err.cannot_represent.name, @typeName(Enum)));
+        const node = result.err.cannot_represent.node;
+        const tokens = ast.nodes.items(.main_token);
         const token = tokens[node];
-        const location = result.ast.tokenLocation(0, token);
+        const location = ast.tokenLocation(0, token);
         try std.testing.expectEqual(Ast.Location{
             .line = 0,
             .column = 0,
@@ -245,13 +245,15 @@ test "numeric enum literals" {
 
     // Float tag
     {
-        var result = try parse(allocator, Enum, "1.5");
+        var ast = try std.zig.Ast.parse(allocator, "1.5", .zon);
+        defer ast.deinit(allocator);
+        var result = try parse(allocator, Enum, &ast);
         defer result.deinit(allocator);
-        try std.testing.expect(std.mem.eql(u8, result.value.type_error.cannot_represent.name, @typeName(Enum)));
-        const node = result.value.type_error.cannot_represent.node;
-        const tokens = result.ast.nodes.items(.main_token);
+        try std.testing.expect(std.mem.eql(u8, result.err.cannot_represent.name, @typeName(Enum)));
+        const node = result.err.cannot_represent.node;
+        const tokens = ast.nodes.items(.main_token);
         const token = tokens[node];
-        const location = result.ast.tokenLocation(0, token);
+        const location = ast.tokenLocation(0, token);
         try std.testing.expectEqual(Ast.Location{
             .line = 0,
             .column = 0,
@@ -287,16 +289,6 @@ fn failCannotRepresent(self: *Parser, comptime T: type, node: NodeIndex) error{T
     } });
 }
 
-fn parseThenFree(allocator: Allocator, comptime T: type, source: [:0]const u8) !T {
-    var result = try parse(allocator, T, source);
-    defer result.deinit(allocator);
-    switch (result.value) {
-        .parse_error => return error.Parse,
-        .type_error => return error.Type,
-        .success => |success| return success,
-    }
-}
-
 fn parseBool(self: *Parser, node: NodeIndex) error{Type}!bool {
     const tags = self.ast.nodes.items(.tag);
     const tokens = self.ast.nodes.items(.main_token);
@@ -319,19 +311,20 @@ test "parse bool" {
     const allocator = std.testing.allocator;
 
     // Correct floats
-    try std.testing.expectEqual(true, try parseThenFree(allocator, bool, "true"));
-    try std.testing.expectEqual(false, try parseThenFree(allocator, bool, "false"));
+    try std.testing.expectEqual(true, try testParseFree(allocator, bool, "true"));
+    try std.testing.expectEqual(false, try testParseFree(allocator, bool, "false"));
 
     // Errors
-    try std.testing.expectError(error.Parse, parseThenFree(allocator, bool, "a b"));
     {
-        var result = try parse(allocator, bool, " foo");
+        var ast = try std.zig.Ast.parse(allocator, " foo", .zon);
+        defer ast.deinit(allocator);
+        var result = try parse(allocator, bool, &ast);
         defer result.deinit(allocator);
-        try std.testing.expect(std.mem.eql(u8, result.value.type_error.expected_type.name, @typeName(bool)));
-        const node = result.value.type_error.expected_type.node;
-        const tokens = result.ast.nodes.items(.main_token);
+        try std.testing.expect(std.mem.eql(u8, result.err.expected_type.name, @typeName(bool)));
+        const node = result.err.expected_type.node;
+        const tokens = ast.nodes.items(.main_token);
         const token = tokens[node];
-        const location = result.ast.tokenLocation(0, token);
+        const location = ast.tokenLocation(0, token);
         try std.testing.expectEqual(Ast.Location{
             .line = 0,
             .column = 1,
@@ -340,13 +333,15 @@ test "parse bool" {
         }, location);
     }
     {
-        var result = try parse(allocator, bool, "123");
+        var ast = try std.zig.Ast.parse(allocator, "123", .zon);
+        defer ast.deinit(allocator);
+        var result = try parse(allocator, bool, &ast);
         defer result.deinit(allocator);
-        try std.testing.expect(std.mem.eql(u8, result.value.type_error.expected_type.name, @typeName(bool)));
-        const node = result.value.type_error.expected_type.node;
-        const tokens = result.ast.nodes.items(.main_token);
+        try std.testing.expect(std.mem.eql(u8, result.err.expected_type.name, @typeName(bool)));
+        const node = result.err.expected_type.node;
+        const tokens = ast.nodes.items(.main_token);
         const token = tokens[node];
-        const location = result.ast.tokenLocation(0, token);
+        const location = ast.tokenLocation(0, token);
         try std.testing.expectEqual(Ast.Location{
             .line = 0,
             .column = 0,
@@ -560,46 +555,48 @@ test "parse int" {
     const allocator = std.testing.allocator;
 
     // Test various numbers and types
-    try std.testing.expectEqual(@as(u8, 10), try parseThenFree(allocator, u8, "10"));
-    try std.testing.expectEqual(@as(i16, 24), try parseThenFree(allocator, i16, "24"));
-    try std.testing.expectEqual(@as(i14, -4), try parseThenFree(allocator, i14, "-4"));
-    try std.testing.expectEqual(@as(i32, -123), try parseThenFree(allocator, i32, "-123"));
+    try std.testing.expectEqual(@as(u8, 10), try testParseFree(allocator, u8, "10"));
+    try std.testing.expectEqual(@as(i16, 24), try testParseFree(allocator, i16, "24"));
+    try std.testing.expectEqual(@as(i14, -4), try testParseFree(allocator, i14, "-4"));
+    try std.testing.expectEqual(@as(i32, -123), try testParseFree(allocator, i32, "-123"));
 
     // Test limits
-    try std.testing.expectEqual(@as(i8, 127), try parseThenFree(allocator, i8, "127"));
-    try std.testing.expectEqual(@as(i8, -128), try parseThenFree(allocator, i8, "-128"));
+    try std.testing.expectEqual(@as(i8, 127), try testParseFree(allocator, i8, "127"));
+    try std.testing.expectEqual(@as(i8, -128), try testParseFree(allocator, i8, "-128"));
 
     // Test characters
-    try std.testing.expectEqual(@as(u8, 'a'), try parseThenFree(allocator, u8, "'a'"));
-    try std.testing.expectEqual(@as(u8, 'z'), try parseThenFree(allocator, u8, "'z'"));
+    try std.testing.expectEqual(@as(u8, 'a'), try testParseFree(allocator, u8, "'a'"));
+    try std.testing.expectEqual(@as(u8, 'z'), try testParseFree(allocator, u8, "'z'"));
 
     // Test big integers
     try std.testing.expectEqual(
         @as(u65, 36893488147419103231),
-        try parseThenFree(allocator, u65, "36893488147419103231"),
+        try testParseFree(allocator, u65, "36893488147419103231"),
     );
     try std.testing.expectEqual(
         @as(u65, 36893488147419103231),
-        try parseThenFree(allocator, u65, "368934_881_474191032_31"),
+        try testParseFree(allocator, u65, "368934_881_474191032_31"),
     );
 
     // Test big integer limits
     try std.testing.expectEqual(
         @as(i66, 36893488147419103231),
-        try parseThenFree(allocator, i66, "36893488147419103231"),
+        try testParseFree(allocator, i66, "36893488147419103231"),
     );
     try std.testing.expectEqual(
         @as(i66, -36893488147419103232),
-        try parseThenFree(allocator, i66, "-36893488147419103232"),
+        try testParseFree(allocator, i66, "-36893488147419103232"),
     );
     {
-        var result = try parse(allocator, i66, "36893488147419103232");
+        var ast = try std.zig.Ast.parse(allocator, "36893488147419103232", .zon);
+        defer ast.deinit(allocator);
+        var result = try parse(allocator, i66, &ast);
         defer result.deinit(allocator);
-        try std.testing.expect(std.mem.eql(u8, result.value.type_error.cannot_represent.name, @typeName(i66)));
-        const node = result.value.type_error.cannot_represent.node;
-        const tokens = result.ast.nodes.items(.main_token);
+        try std.testing.expect(std.mem.eql(u8, result.err.cannot_represent.name, @typeName(i66)));
+        const node = result.err.cannot_represent.node;
+        const tokens = ast.nodes.items(.main_token);
         const token = tokens[node];
-        const location = result.ast.tokenLocation(0, token);
+        const location = ast.tokenLocation(0, token);
         try std.testing.expectEqual(Ast.Location{
             .line = 0,
             .column = 0,
@@ -608,13 +605,15 @@ test "parse int" {
         }, location);
     }
     {
-        var result = try parse(allocator, i66, "-36893488147419103233");
+        var ast = try std.zig.Ast.parse(allocator, "-36893488147419103233", .zon);
+        defer ast.deinit(allocator);
+        var result = try parse(allocator, i66, &ast);
         defer result.deinit(allocator);
-        try std.testing.expect(std.mem.eql(u8, result.value.type_error.cannot_represent.name, @typeName(i66)));
-        const node = result.value.type_error.cannot_represent.node;
-        const tokens = result.ast.nodes.items(.main_token);
+        try std.testing.expect(std.mem.eql(u8, result.err.cannot_represent.name, @typeName(i66)));
+        const node = result.err.cannot_represent.node;
+        const tokens = ast.nodes.items(.main_token);
         const token = tokens[node];
-        const location = result.ast.tokenLocation(0, token);
+        const location = ast.tokenLocation(0, token);
         try std.testing.expectEqual(Ast.Location{
             .line = 0,
             .column = 0,
@@ -624,59 +623,59 @@ test "parse int" {
     }
 
     // Test parsing whole number floats as integers
-    try std.testing.expectEqual(@as(i8, -1), try parseThenFree(allocator, i8, "-1.0"));
-    try std.testing.expectEqual(@as(i8, 123), try parseThenFree(allocator, i8, "123.0"));
+    try std.testing.expectEqual(@as(i8, -1), try testParseFree(allocator, i8, "-1.0"));
+    try std.testing.expectEqual(@as(i8, 123), try testParseFree(allocator, i8, "123.0"));
 
     // Test non-decimal integers
-    try std.testing.expectEqual(@as(i16, 0xff), try parseThenFree(allocator, i16, "0xff"));
-    try std.testing.expectEqual(@as(i16, -0xff), try parseThenFree(allocator, i16, "-0xff"));
-    try std.testing.expectEqual(@as(i16, 0o77), try parseThenFree(allocator, i16, "0o77"));
-    try std.testing.expectEqual(@as(i16, -0o77), try parseThenFree(allocator, i16, "-0o77"));
-    try std.testing.expectEqual(@as(i16, 0b11), try parseThenFree(allocator, i16, "0b11"));
-    try std.testing.expectEqual(@as(i16, -0b11), try parseThenFree(allocator, i16, "-0b11"));
+    try std.testing.expectEqual(@as(i16, 0xff), try testParseFree(allocator, i16, "0xff"));
+    try std.testing.expectEqual(@as(i16, -0xff), try testParseFree(allocator, i16, "-0xff"));
+    try std.testing.expectEqual(@as(i16, 0o77), try testParseFree(allocator, i16, "0o77"));
+    try std.testing.expectEqual(@as(i16, -0o77), try testParseFree(allocator, i16, "-0o77"));
+    try std.testing.expectEqual(@as(i16, 0b11), try testParseFree(allocator, i16, "0b11"));
+    try std.testing.expectEqual(@as(i16, -0b11), try testParseFree(allocator, i16, "-0b11"));
 
     // Test non-decimal big integers
-    try std.testing.expectEqual(@as(u65, 0x1ffffffffffffffff), try parseThenFree(
+    try std.testing.expectEqual(@as(u65, 0x1ffffffffffffffff), try testParseFree(
         allocator,
         u65,
         "0x1ffffffffffffffff",
     ));
-    try std.testing.expectEqual(@as(i66, 0x1ffffffffffffffff), try parseThenFree(
+    try std.testing.expectEqual(@as(i66, 0x1ffffffffffffffff), try testParseFree(
         allocator,
         i66,
         "0x1ffffffffffffffff",
     ));
-    try std.testing.expectEqual(@as(i66, -0x1ffffffffffffffff), try parseThenFree(
+    try std.testing.expectEqual(@as(i66, -0x1ffffffffffffffff), try testParseFree(
         allocator,
         i66,
         "-0x1ffffffffffffffff",
     ));
-    try std.testing.expectEqual(@as(u65, 0x1ffffffffffffffff), try parseThenFree(
+    try std.testing.expectEqual(@as(u65, 0x1ffffffffffffffff), try testParseFree(
         allocator,
         u65,
         "0o3777777777777777777777",
     ));
-    try std.testing.expectEqual(@as(i66, 0x1ffffffffffffffff), try parseThenFree(
+    try std.testing.expectEqual(@as(i66, 0x1ffffffffffffffff), try testParseFree(
         allocator,
         i66,
         "0o3777777777777777777777",
     ));
-    try std.testing.expectEqual(@as(i66, -0x1ffffffffffffffff), try parseThenFree(
+    try std.testing.expectEqual(@as(i66, -0x1ffffffffffffffff), try testParseFree(
         allocator,
         i66,
         "-0o3777777777777777777777",
     ));
-    try std.testing.expectEqual(@as(u65, 0x1ffffffffffffffff), try parseThenFree(
+    try std.testing.expectEqual(@as(u65, 0x1ffffffffffffffff), try testParseFree(
         allocator,
         u65,
         "0b11111111111111111111111111111111111111111111111111111111111111111",
     ));
-    try std.testing.expectEqual(@as(i66, 0x1ffffffffffffffff), try parseThenFree(
+    try std.testing.expectEqual(@as(i66, 0x1ffffffffffffffff), try testParseFree(
         allocator,
         i66,
         "0b11111111111111111111111111111111111111111111111111111111111111111",
     ));
-    try std.testing.expectEqual(@as(i66, -0x1ffffffffffffffff), try parseThenFree(
+    try std.testing.expectEqual(@as(i66, -0x1ffffffffffffffff), try testParseFree(
         allocator,
         i66,
         "-0b11111111111111111111111111111111111111111111111111111111111111111",
@@ -684,13 +683,15 @@ test "parse int" {
 
     // Failinig to parse as int
     {
-        var result = try parse(allocator, u8, "true");
+        var ast = try std.zig.Ast.parse(allocator, "true", .zon);
+        defer ast.deinit(allocator);
+        var result = try parse(allocator, u8, &ast);
         defer result.deinit(allocator);
-        try std.testing.expect(std.mem.eql(u8, result.value.type_error.expected_type.name, @typeName(u8)));
-        const node = result.value.type_error.expected_type.node;
-        const tokens = result.ast.nodes.items(.main_token);
+        try std.testing.expect(std.mem.eql(u8, result.err.expected_type.name, @typeName(u8)));
+        const node = result.err.expected_type.node;
+        const tokens = ast.nodes.items(.main_token);
         const token = tokens[node];
-        const location = result.ast.tokenLocation(0, token);
+        const location = ast.tokenLocation(0, token);
         try std.testing.expectEqual(Ast.Location{
             .line = 0,
             .column = 0,
@@ -701,13 +702,15 @@ test "parse int" {
 
     // Failing because an int is out of range
     {
-        var result = try parse(allocator, u8, "256");
+        var ast = try std.zig.Ast.parse(allocator, "256", .zon);
+        defer ast.deinit(allocator);
+        var result = try parse(allocator, u8, &ast);
         defer result.deinit(allocator);
-        try std.testing.expect(std.mem.eql(u8, result.value.type_error.cannot_represent.name, @typeName(u8)));
-        const node = result.value.type_error.cannot_represent.node;
-        const tokens = result.ast.nodes.items(.main_token);
+        try std.testing.expect(std.mem.eql(u8, result.err.cannot_represent.name, @typeName(u8)));
+        const node = result.err.cannot_represent.node;
+        const tokens = ast.nodes.items(.main_token);
         const token = tokens[node];
-        const location = result.ast.tokenLocation(0, token);
+        const location = ast.tokenLocation(0, token);
         try std.testing.expectEqual(Ast.Location{
             .line = 0,
             .column = 0,
@@ -718,13 +721,15 @@ test "parse int" {
 
     // Failing because a negative int is out of range
     {
-        var result = try parse(allocator, i8, "-129");
+        var ast = try std.zig.Ast.parse(allocator, "-129", .zon);
+        defer ast.deinit(allocator);
+        var result = try parse(allocator, i8, &ast);
         defer result.deinit(allocator);
-        try std.testing.expect(std.mem.eql(u8, result.value.type_error.cannot_represent.name, @typeName(i8)));
-        const node = result.value.type_error.cannot_represent.node;
-        const tokens = result.ast.nodes.items(.main_token);
+        try std.testing.expect(std.mem.eql(u8, result.err.cannot_represent.name, @typeName(i8)));
+        const node = result.err.cannot_represent.node;
+        const tokens = ast.nodes.items(.main_token);
         const token = tokens[node];
-        const location = result.ast.tokenLocation(0, token);
+        const location = ast.tokenLocation(0, token);
         try std.testing.expectEqual(Ast.Location{
             .line = 0,
             .column = 0,
@@ -735,13 +740,15 @@ test "parse int" {
 
     // Failing because an unsigned int is negative
     {
-        var result = try parse(allocator, u8, "-1");
+        var ast = try std.zig.Ast.parse(allocator, "-1", .zon);
+        defer ast.deinit(allocator);
+        var result = try parse(allocator, u8, &ast);
         defer result.deinit(allocator);
-        try std.testing.expect(std.mem.eql(u8, result.value.type_error.cannot_represent.name, @typeName(u8)));
-        const node = result.value.type_error.cannot_represent.node;
-        const tokens = result.ast.nodes.items(.main_token);
+        try std.testing.expect(std.mem.eql(u8, result.err.cannot_represent.name, @typeName(u8)));
+        const node = result.err.cannot_represent.node;
+        const tokens = ast.nodes.items(.main_token);
         const token = tokens[node];
-        const location = result.ast.tokenLocation(0, token);
+        const location = ast.tokenLocation(0, token);
         try std.testing.expectEqual(Ast.Location{
             .line = 0,
             .column = 0,
@@ -752,13 +759,15 @@ test "parse int" {
 
     // Failing because a float is non-whole
     {
-        var result = try parse(allocator, u8, "1.5");
+        var ast = try std.zig.Ast.parse(allocator, "1.5", .zon);
+        defer ast.deinit(allocator);
+        var result = try parse(allocator, u8, &ast);
         defer result.deinit(allocator);
-        try std.testing.expect(std.mem.eql(u8, result.value.type_error.cannot_represent.name, @typeName(u8)));
-        const node = result.value.type_error.cannot_represent.node;
-        const tokens = result.ast.nodes.items(.main_token);
+        try std.testing.expect(std.mem.eql(u8, result.err.cannot_represent.name, @typeName(u8)));
+        const node = result.err.cannot_represent.node;
+        const tokens = ast.nodes.items(.main_token);
         const token = tokens[node];
-        const location = result.ast.tokenLocation(0, token);
+        const location = ast.tokenLocation(0, token);
         try std.testing.expectEqual(Ast.Location{
             .line = 0,
             .column = 0,
@@ -769,13 +778,15 @@ test "parse int" {
 
     // Failing because a float is negative
     {
-        var result = try parse(allocator, u8, "-1.0");
+        var ast = try std.zig.Ast.parse(allocator, "-1.0", .zon);
+        defer ast.deinit(allocator);
+        var result = try parse(allocator, u8, &ast);
         defer result.deinit(allocator);
-        try std.testing.expect(std.mem.eql(u8, result.value.type_error.cannot_represent.name, @typeName(u8)));
-        const node = result.value.type_error.cannot_represent.node;
-        const tokens = result.ast.nodes.items(.main_token);
+        try std.testing.expect(std.mem.eql(u8, result.err.cannot_represent.name, @typeName(u8)));
+        const node = result.err.cannot_represent.node;
+        const tokens = ast.nodes.items(.main_token);
         const token = tokens[node];
-        const location = result.ast.tokenLocation(0, token);
+        const location = ast.tokenLocation(0, token);
         try std.testing.expectEqual(Ast.Location{
             .line = 0,
             .column = 0,
@@ -789,51 +800,51 @@ test "parse float" {
     const allocator = std.testing.allocator;
 
     // Test decimals
-    try std.testing.expectEqual(@as(f16, 0.5), try parseThenFree(allocator, f16, "0.5"));
-    try std.testing.expectEqual(@as(f32, 123.456), try parseThenFree(allocator, f32, "123.456"));
-    try std.testing.expectEqual(@as(f64, -123.456), try parseThenFree(allocator, f64, "-123.456"));
-    try std.testing.expectEqual(@as(f128, 42.5), try parseThenFree(allocator, f128, "42.5"));
+    try std.testing.expectEqual(@as(f16, 0.5), try testParseFree(allocator, f16, "0.5"));
+    try std.testing.expectEqual(@as(f32, 123.456), try testParseFree(allocator, f32, "123.456"));
+    try std.testing.expectEqual(@as(f64, -123.456), try testParseFree(allocator, f64, "-123.456"));
+    try std.testing.expectEqual(@as(f128, 42.5), try testParseFree(allocator, f128, "42.5"));
 
     // Test whole numbers with and without decimals
-    try std.testing.expectEqual(@as(f16, 5.0), try parseThenFree(allocator, f16, "5.0"));
-    try std.testing.expectEqual(@as(f16, 5.0), try parseThenFree(allocator, f16, "5"));
-    try std.testing.expectEqual(@as(f32, -102), try parseThenFree(allocator, f32, "-102.0"));
-    try std.testing.expectEqual(@as(f32, -102), try parseThenFree(allocator, f32, "-102"));
+    try std.testing.expectEqual(@as(f16, 5.0), try testParseFree(allocator, f16, "5.0"));
+    try std.testing.expectEqual(@as(f16, 5.0), try testParseFree(allocator, f16, "5"));
+    try std.testing.expectEqual(@as(f32, -102), try testParseFree(allocator, f32, "-102.0"));
+    try std.testing.expectEqual(@as(f32, -102), try testParseFree(allocator, f32, "-102"));
 
     // Test characters and negated characters
-    try std.testing.expectEqual(@as(f32, 'a'), try parseThenFree(allocator, f32, "'a'"));
-    try std.testing.expectEqual(@as(f32, 'z'), try parseThenFree(allocator, f32, "'z'"));
-    try std.testing.expectEqual(@as(f32, -'z'), try parseThenFree(allocator, f32, "-'z'"));
+    try std.testing.expectEqual(@as(f32, 'a'), try testParseFree(allocator, f32, "'a'"));
+    try std.testing.expectEqual(@as(f32, 'z'), try testParseFree(allocator, f32, "'z'"));
+    try std.testing.expectEqual(@as(f32, -'z'), try testParseFree(allocator, f32, "-'z'"));
 
     // Test big integers
     try std.testing.expectEqual(
         @as(f32, 36893488147419103231),
-        try parseThenFree(allocator, f32, "36893488147419103231"),
+        try testParseFree(allocator, f32, "36893488147419103231"),
     );
     try std.testing.expectEqual(
         @as(f32, -36893488147419103231),
-        try parseThenFree(allocator, f32, "-36893488147419103231"),
+        try testParseFree(allocator, f32, "-36893488147419103231"),
     );
-    try std.testing.expectEqual(@as(f128, 0x1ffffffffffffffff), try parseThenFree(
+    try std.testing.expectEqual(@as(f128, 0x1ffffffffffffffff), try testParseFree(
         allocator,
         f128,
         "0x1ffffffffffffffff",
     ));
-    try std.testing.expectEqual(@as(f32, 0x1ffffffffffffffff), try parseThenFree(
+    try std.testing.expectEqual(@as(f32, 0x1ffffffffffffffff), try testParseFree(
         allocator,
         f32,
         "0x1ffffffffffffffff",
     ));
 
     // Exponents, underscores
-    try std.testing.expectEqual(@as(f32, 123.0E+77), try parseThenFree(allocator, f32, "12_3.0E+77"));
+    try std.testing.expectEqual(@as(f32, 123.0E+77), try testParseFree(allocator, f32, "12_3.0E+77"));
 
     // Hexadecimal
-    try std.testing.expectEqual(@as(f32, 0x103.70p-5), try parseThenFree(allocator, f32, "0x103.70p-5"));
-    try std.testing.expectEqual(@as(f32, -0x103.70), try parseThenFree(allocator, f32, "-0x103.70"));
+    try std.testing.expectEqual(@as(f32, 0x103.70p-5), try testParseFree(allocator, f32, "0x103.70p-5"));
+    try std.testing.expectEqual(@as(f32, -0x103.70), try testParseFree(allocator, f32, "-0x103.70"));
     try std.testing.expectEqual(
         @as(f32, 0x1234_5678.9ABC_CDEFp-10),
-        try parseThenFree(allocator, f32, "0x1234_5678.9ABC_CDEFp-10"),
+        try testParseFree(allocator, f32, "0x1234_5678.9ABC_CDEFp-10"),
     );
 }
 
