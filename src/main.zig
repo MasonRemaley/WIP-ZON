@@ -74,7 +74,8 @@ pub fn parseExpr(self: *Parser, comptime T: type, node: NodeIndex) error{ OutOfM
         .Bool => return self.parseBool(node),
         .Int, .Float => return self.parseNumber(T, node),
         .Enum => return self.parseEnumLiteral(T, node),
-        .Pointer => return self.parsePointer(T, node),
+        // TODO: combined for now for strings...
+        .Pointer, .Array => return self.parsePointer(T, node),
         // TODO: keep in sync with parseFree
         else => unreachable,
     }
@@ -89,24 +90,35 @@ fn parsePointer(self: *Parser, comptime T: type, node: NodeIndex) error{ OutOfMe
     };
 }
 
+// XXX: WIP:
+// - to store a string literal in an array, we should need .*
+//      + would be convenient to allow capped size strings to be stored inline
+// - eventually write result to out parameter pointer instead of returning it? or does it not matter?
+// - assuming string literal syntax, not supporting other types of arrays right now
+// - 0 termination?
+// - wide strings?
+// - are single chars valid in place of string literals?
+// - we have to handle invalid string literals here, the parser doesn't catch those errors in advance
+//   right?
+// - error handling ehre not really implemented yet, lots of debug mode assertions for now
 fn parseStringLiteral(self: *Parser, comptime T: type, node: NodeIndex) error{ OutOfMemory, Type }!T {
-    // XXX: 0 terminated?
-    // XXX: wide strings?
-    // XXX: is a 'c' single char allowed as a string literal?
-    // XXX: just assuming slice for now...allow all variants where possible in zig too
-    const Pointer = @typeInfo(T).Pointer;
-    switch (Pointer.size) {
-        .Slice => {},
-        .One, .Many, .C => unreachable,
-    }
-    // XXX: assuming u8 for now...not sure if correct or not
-    if (Pointer.child != u8) unreachable;
-
     const tokens = self.ast.nodes.items(.main_token);
     const token = tokens[node];
     const raw_string = self.ast.tokenSlice(token);
-    // XXX: handle errors here...not caught by parser right?
-    return std.zig.string_literal.parseAlloc(self.allocator, raw_string) catch unreachable;
+    switch (@typeInfo(T)) {
+        .Pointer => |Pointer| {
+            comptime assert(Pointer.size == .Slice);
+            comptime assert(Pointer.child == u8);
+            return std.zig.string_literal.parseAlloc(self.allocator, raw_string) catch unreachable;
+        },
+        .Array => {
+            var result: T = undefined;
+            var fsw = std.io.fixedBufferStream(&result);
+            _ = std.zig.string_literal.parseWrite(fsw.writer(), raw_string) catch unreachable;
+            return result;
+        },
+        else => unreachable,
+    }
 }
 
 test "string literal" {
@@ -126,8 +138,27 @@ test "string literal" {
         try std.testing.expectEqualSlices(u8, @as([]const u8, "ab\nc"), parsed);
     }
 
-    // XXX: change to have a parser that stores the error instead of returning a union
-    // XXX: test escape characters, mutable vs non mutable, freeing, limited size strings etc
+    // Fixed size string literal
+    {
+        const parsed = try parseSlice(allocator, [4]u8, "\"ab\\nc\"");
+        try std.testing.expectEqualSlices(u8, "ab\nc", &parsed);
+    }
+
+    // XXX: implement these tests
+    // // Too short
+    // {
+    //     const parsed = try parseSlice(allocator, [3]u8, "\"ab\"");
+    //     try std.testing.expectEqualSlices(u8, "ab\nc", &parsed);
+    // }
+
+    // // Too long
+    // {
+    //     const parsed = try parseSlice(allocator, [3]u8, "\"abcd\"");
+    //     try std.testing.expectEqualSlices(u8, "ab\nc", &parsed);
+    // }
+
+    // XXX: mutable vs non mutable (allowed?), freeing, limited size strings etc
+    // XXX: allow references to literals or no?
 }
 
 // TODO: cannot represent not quite right error for unknown field right?
@@ -141,7 +172,7 @@ fn parseEnumLiteral(self: *Parser, comptime T: type, node: NodeIndex) error{Type
 }
 
 fn parseEnumNumber(self: *Parser, comptime T: type, node: NodeIndex) error{Type}!T {
-    // XXX: kinda weird dup error handling?
+    // TODO: kinda weird dup error handling?
     var number = self.parseNumber(@typeInfo(T).Enum.tag_type, node) catch
         return self.failCannotRepresent(T, node);
     return std.meta.intToEnum(T, number) catch
@@ -188,9 +219,9 @@ test "enum literals" {
     {
         var ast = try std.zig.Ast.parse(allocator, ".qux", .zon);
         defer ast.deinit(allocator);
-        var err: Error = .success; // XXX: do i need to label type?
+        var err: Error = .success;
         try std.testing.expectError(error.Type, parse(allocator, Enum, &ast, &err));
-        try std.testing.expect(std.mem.eql(u8, err.cannot_represent.name, @typeName(Enum)));
+        try std.testing.expectEqualSlices(u8, err.cannot_represent.name, @typeName(Enum));
         const node = err.cannot_represent.node;
         const tokens = ast.nodes.items(.main_token);
         const token = tokens[node];
@@ -207,9 +238,9 @@ test "enum literals" {
     {
         var ast = try std.zig.Ast.parse(allocator, "true", .zon);
         defer ast.deinit(allocator);
-        var err: Error = .success; // XXX: do i need to label type?
+        var err: Error = .success;
         try std.testing.expectError(error.Type, parse(allocator, Enum, &ast, &err));
-        try std.testing.expect(std.mem.eql(u8, err.expected_type.name, @typeName(Enum)));
+        try std.testing.expectEqualSlices(u8, err.expected_type.name, @typeName(Enum));
         const node = err.expected_type.node;
         const tokens = ast.nodes.items(.main_token);
         const token = tokens[node];
@@ -246,10 +277,10 @@ test "numeric enum literals" {
     {
         var ast = try std.zig.Ast.parse(allocator, "2", .zon);
         defer ast.deinit(allocator);
-        var err: Error = .success; // XXX: do i need to label type?
+        var err: Error = .success;
         try std.testing.expectError(error.Type, parse(allocator, Enum, &ast, &err));
         // XXX: use expect slice for these
-        try std.testing.expect(std.mem.eql(u8, err.cannot_represent.name, @typeName(Enum)));
+        try std.testing.expectEqualSlices(u8, err.cannot_represent.name, @typeName(Enum));
         const node = err.cannot_represent.node;
         const tokens = ast.nodes.items(.main_token);
         const token = tokens[node];
@@ -266,9 +297,9 @@ test "numeric enum literals" {
     {
         var ast = try std.zig.Ast.parse(allocator, "256", .zon);
         defer ast.deinit(allocator);
-        var err: Error = .success; // XXX: do i need to label type?
+        var err: Error = .success;
         try std.testing.expectError(error.Type, parse(allocator, Enum, &ast, &err));
-        try std.testing.expect(std.mem.eql(u8, err.cannot_represent.name, @typeName(Enum)));
+        try std.testing.expectEqualSlices(u8, err.cannot_represent.name, @typeName(Enum));
         const node = err.cannot_represent.node;
         const tokens = ast.nodes.items(.main_token);
         const token = tokens[node];
@@ -285,9 +316,9 @@ test "numeric enum literals" {
     {
         var ast = try std.zig.Ast.parse(allocator, "-3", .zon);
         defer ast.deinit(allocator);
-        var err: Error = .success; // XXX: do i need to label type?
+        var err: Error = .success;
         try std.testing.expectError(error.Type, parse(allocator, Enum, &ast, &err));
-        try std.testing.expect(std.mem.eql(u8, err.cannot_represent.name, @typeName(Enum)));
+        try std.testing.expectEqualSlices(u8, err.cannot_represent.name, @typeName(Enum));
         const node = err.cannot_represent.node;
         const tokens = ast.nodes.items(.main_token);
         const token = tokens[node];
@@ -304,9 +335,9 @@ test "numeric enum literals" {
     {
         var ast = try std.zig.Ast.parse(allocator, "1.5", .zon);
         defer ast.deinit(allocator);
-        var err: Error = .success; // XXX: do i need to label type?
+        var err: Error = .success;
         try std.testing.expectError(error.Type, parse(allocator, Enum, &ast, &err));
-        try std.testing.expect(std.mem.eql(u8, err.cannot_represent.name, @typeName(Enum)));
+        try std.testing.expectEqualSlices(u8, err.cannot_represent.name, @typeName(Enum));
         const node = err.cannot_represent.node;
         const tokens = ast.nodes.items(.main_token);
         const token = tokens[node];
@@ -378,9 +409,9 @@ test "parse bool" {
     {
         var ast = try std.zig.Ast.parse(allocator, " foo", .zon);
         defer ast.deinit(allocator);
-        var err: Error = .success; // XXX: do i need to label type?
+        var err: Error = .success;
         try std.testing.expectError(error.Type, parse(allocator, bool, &ast, &err));
-        try std.testing.expect(std.mem.eql(u8, err.expected_type.name, @typeName(bool)));
+        try std.testing.expectEqualSlices(u8, err.expected_type.name, @typeName(bool));
         const node = err.expected_type.node;
         const tokens = ast.nodes.items(.main_token);
         const token = tokens[node];
@@ -395,9 +426,9 @@ test "parse bool" {
     {
         var ast = try std.zig.Ast.parse(allocator, "123", .zon);
         defer ast.deinit(allocator);
-        var err: Error = .success; // XXX: do i need to label type?
+        var err: Error = .success;
         try std.testing.expectError(error.Type, parse(allocator, bool, &ast, &err));
-        try std.testing.expect(std.mem.eql(u8, err.expected_type.name, @typeName(bool)));
+        try std.testing.expectEqualSlices(u8, err.expected_type.name, @typeName(bool));
         const node = err.expected_type.node;
         const tokens = ast.nodes.items(.main_token);
         const token = tokens[node];
@@ -650,9 +681,9 @@ test "parse int" {
     {
         var ast = try std.zig.Ast.parse(allocator, "36893488147419103232", .zon);
         defer ast.deinit(allocator);
-        var err: Error = .success; // XXX: do i need to label type?
+        var err: Error = .success;
         try std.testing.expectError(error.Type, parse(allocator, i66, &ast, &err));
-        try std.testing.expect(std.mem.eql(u8, err.cannot_represent.name, @typeName(i66)));
+        try std.testing.expectEqualSlices(u8, err.cannot_represent.name, @typeName(i66));
         const node = err.cannot_represent.node;
         const tokens = ast.nodes.items(.main_token);
         const token = tokens[node];
@@ -667,9 +698,9 @@ test "parse int" {
     {
         var ast = try std.zig.Ast.parse(allocator, "-36893488147419103233", .zon);
         defer ast.deinit(allocator);
-        var err: Error = .success; // XXX: do i need to label type?
+        var err: Error = .success;
         try std.testing.expectError(error.Type, parse(allocator, i66, &ast, &err));
-        try std.testing.expect(std.mem.eql(u8, err.cannot_represent.name, @typeName(i66)));
+        try std.testing.expectEqualSlices(u8, err.cannot_represent.name, @typeName(i66));
         const node = err.cannot_represent.node;
         const tokens = ast.nodes.items(.main_token);
         const token = tokens[node];
@@ -745,9 +776,9 @@ test "parse int" {
     {
         var ast = try std.zig.Ast.parse(allocator, "true", .zon);
         defer ast.deinit(allocator);
-        var err: Error = .success; // XXX: do i need to label type?
+        var err: Error = .success;
         try std.testing.expectError(error.Type, parse(allocator, u8, &ast, &err));
-        try std.testing.expect(std.mem.eql(u8, err.expected_type.name, @typeName(u8)));
+        try std.testing.expectEqualSlices(u8, err.expected_type.name, @typeName(u8));
         const node = err.expected_type.node;
         const tokens = ast.nodes.items(.main_token);
         const token = tokens[node];
@@ -764,9 +795,9 @@ test "parse int" {
     {
         var ast = try std.zig.Ast.parse(allocator, "256", .zon);
         defer ast.deinit(allocator);
-        var err: Error = .success; // XXX: do i need to label type?
+        var err: Error = .success;
         try std.testing.expectError(error.Type, parse(allocator, u8, &ast, &err));
-        try std.testing.expect(std.mem.eql(u8, err.cannot_represent.name, @typeName(u8)));
+        try std.testing.expectEqualSlices(u8, err.cannot_represent.name, @typeName(u8));
         const node = err.cannot_represent.node;
         const tokens = ast.nodes.items(.main_token);
         const token = tokens[node];
@@ -783,9 +814,9 @@ test "parse int" {
     {
         var ast = try std.zig.Ast.parse(allocator, "-129", .zon);
         defer ast.deinit(allocator);
-        var err: Error = .success; // XXX: do i need to label type?
+        var err: Error = .success;
         try std.testing.expectError(error.Type, parse(allocator, i8, &ast, &err));
-        try std.testing.expect(std.mem.eql(u8, err.cannot_represent.name, @typeName(i8)));
+        try std.testing.expectEqualSlices(u8, err.cannot_represent.name, @typeName(i8));
         const node = err.cannot_represent.node;
         const tokens = ast.nodes.items(.main_token);
         const token = tokens[node];
@@ -802,9 +833,9 @@ test "parse int" {
     {
         var ast = try std.zig.Ast.parse(allocator, "-1", .zon);
         defer ast.deinit(allocator);
-        var err: Error = .success; // XXX: do i need to label type?
+        var err: Error = .success;
         try std.testing.expectError(error.Type, parse(allocator, u8, &ast, &err));
-        try std.testing.expect(std.mem.eql(u8, err.cannot_represent.name, @typeName(u8)));
+        try std.testing.expectEqualSlices(u8, err.cannot_represent.name, @typeName(u8));
         const node = err.cannot_represent.node;
         const tokens = ast.nodes.items(.main_token);
         const token = tokens[node];
@@ -821,9 +852,9 @@ test "parse int" {
     {
         var ast = try std.zig.Ast.parse(allocator, "1.5", .zon);
         defer ast.deinit(allocator);
-        var err: Error = .success; // XXX: do i need to label type?
+        var err: Error = .success;
         try std.testing.expectError(error.Type, parse(allocator, u8, &ast, &err));
-        try std.testing.expect(std.mem.eql(u8, err.cannot_represent.name, @typeName(u8)));
+        try std.testing.expectEqualSlices(u8, err.cannot_represent.name, @typeName(u8));
         const node = err.cannot_represent.node;
         const tokens = ast.nodes.items(.main_token);
         const token = tokens[node];
@@ -840,9 +871,9 @@ test "parse int" {
     {
         var ast = try std.zig.Ast.parse(allocator, "-1.0", .zon);
         defer ast.deinit(allocator);
-        var err: Error = .success; // XXX: do i need to label type?
+        var err: Error = .success;
         try std.testing.expectError(error.Type, parse(allocator, u8, &ast, &err));
-        try std.testing.expect(std.mem.eql(u8, err.cannot_represent.name, @typeName(u8)));
+        try std.testing.expectEqualSlices(u8, err.cannot_represent.name, @typeName(u8));
         const node = err.cannot_represent.node;
         const tokens = ast.nodes.items(.main_token);
         const token = tokens[node];
