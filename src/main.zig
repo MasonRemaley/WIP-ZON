@@ -15,6 +15,7 @@ ast: *const Ast,
 err: ?*Error,
 
 // XXX: naming?
+// TODO: make a render errors function...handle underlines as well as point of error like zig? How?
 pub const Error = union(enum) {
     success: void,
     expected_type: struct {
@@ -26,19 +27,6 @@ pub const Error = union(enum) {
         node: NodeIndex,
     },
 };
-
-pub fn Result(comptime T: type) type {
-    // TODO: make a render errors function...
-    return union(enum) {
-        success: T,
-        err: Error,
-
-        // TODO: unimplemented...
-        fn deinit(self: *@This(), _: Allocator) void {
-            self.* = undefined;
-        }
-    };
-}
 
 pub fn parse(allocator: Allocator, comptime T: type, ast: *const Ast, err: ?*Error) error{ OutOfMemory, Type }!T {
     var parser = Parser{
@@ -75,25 +63,36 @@ pub fn parseExpr(self: *Parser, comptime T: type, node: NodeIndex) error{ OutOfM
         .Int, .Float => return self.parseNumber(T, node),
         .Enum => return self.parseEnumLiteral(T, node),
         // TODO: combined for now for strings...
-        .Pointer, .Array => return self.parsePointer(T, node),
+        .Pointer => return self.parsePointer(T, node),
+        .Array => return self.parseArray(T, node),
         // TODO: keep in sync with parseFree
         else => unreachable,
     }
+}
+
+fn parseArray(self: *Parser, comptime T: type, node: NodeIndex) error{Type}!T {
+    const tags = self.ast.nodes.items(.tag);
+    return switch (tags[node]) {
+        // XXX: support other arrays?
+        .deref => try self.parseStringLiteral(T, node),
+        // XXX: support other array syntaxes!
+        else => return self.failExpectedType(T, node),
+    };
 }
 
 fn parsePointer(self: *Parser, comptime T: type, node: NodeIndex) error{ OutOfMemory, Type }!T {
     const tags = self.ast.nodes.items(.tag);
     return switch (tags[node]) {
         .string_literal => try self.parseStringLiteral(T, node),
-        // XXX: support other slice syntaxes!
+        // XXX: support other pointer syntaxes!
         else => return self.failExpectedType(T, node),
     };
 }
 
 // XXX: WIP:
 // - to store a string literal in an array, we should need .*
+//      + allow & and .* in general or no?
 //      + would be convenient to allow capped size strings to be stored inline
-// - eventually write result to out parameter pointer instead of returning it? or does it not matter?
 // - assuming string literal syntax, not supporting other types of arrays right now
 // - 0 termination?
 // - wide strings?
@@ -101,20 +100,35 @@ fn parsePointer(self: *Parser, comptime T: type, node: NodeIndex) error{ OutOfMe
 // - we have to handle invalid string literals here, the parser doesn't catch those errors in advance
 //   right?
 // - error handling ehre not really implemented yet, lots of debug mode assertions for now
-fn parseStringLiteral(self: *Parser, comptime T: type, node: NodeIndex) error{ OutOfMemory, Type }!T {
-    const tokens = self.ast.nodes.items(.main_token);
-    const token = tokens[node];
-    const raw_string = self.ast.tokenSlice(token);
+fn parseStringLiteral(self: *Parser, comptime T: type, node: NodeIndex) !T {
     switch (@typeInfo(T)) {
         .Pointer => |Pointer| {
+            const tokens = self.ast.nodes.items(.main_token);
+            const token = tokens[node];
+            const raw_string = self.ast.tokenSlice(token);
+
             comptime assert(Pointer.size == .Slice);
             comptime assert(Pointer.child == u8);
+            if (!Pointer.is_const) {
+                return self.failExpectedType(T, node);
+            }
             return std.zig.string_literal.parseAlloc(self.allocator, raw_string) catch unreachable;
         },
-        .Array => {
+        .Array => |Array| {
+            const data = self.ast.nodes.items(.data);
+            const literal = data[node].lhs;
+            const tokens = self.ast.nodes.items(.main_token);
+            const token = tokens[literal];
+            const raw_string = self.ast.tokenSlice(token);
+
             var result: T = undefined;
             var fsw = std.io.fixedBufferStream(&result);
-            _ = std.zig.string_literal.parseWrite(fsw.writer(), raw_string) catch unreachable;
+            _ = std.zig.string_literal.parseWrite(fsw.writer(), raw_string) catch |e| switch (e) {
+                error.NoSpaceLeft => return self.failExpectedType(T, node),
+            };
+            if (Array.len != fsw.pos) {
+                return self.failExpectedType(T, node);
+            }
             return result;
         },
         else => unreachable,
@@ -138,27 +152,106 @@ test "string literal" {
         try std.testing.expectEqualSlices(u8, @as([]const u8, "ab\nc"), parsed);
     }
 
+    // Passing string literal to a mutable slice
+    {
+        var ast = try std.zig.Ast.parse(allocator, "\"abcd\"", .zon);
+        defer ast.deinit(allocator);
+        var err: Error = .success;
+        try std.testing.expectError(error.Type, parse(allocator, []u8, &ast, &err));
+        try std.testing.expectEqualSlices(u8, err.expected_type.name, @typeName([]u8));
+        const node = err.expected_type.node;
+        const tokens = ast.nodes.items(.main_token);
+        const token = tokens[node];
+        const location = ast.tokenLocation(0, token);
+        try std.testing.expectEqual(Ast.Location{
+            .line = 0,
+            .column = 0,
+            .line_start = 0,
+            .line_end = 6,
+        }, location);
+    }
+
+    // Passing slice to fixed size array
+    {
+        var ast = try std.zig.Ast.parse(allocator, "\"abcd\"", .zon);
+        defer ast.deinit(allocator);
+        var err: Error = .success;
+        try std.testing.expectError(error.Type, parse(allocator, [4]u8, &ast, &err));
+        try std.testing.expectEqualSlices(u8, err.expected_type.name, @typeName([4]u8));
+        const node = err.expected_type.node;
+        const tokens = ast.nodes.items(.main_token);
+        const token = tokens[node];
+        const location = ast.tokenLocation(0, token);
+        try std.testing.expectEqual(Ast.Location{
+            .line = 0,
+            .column = 0,
+            .line_start = 0,
+            .line_end = 6,
+        }, location);
+    }
+
+    // Passing fixed slice array, expected slice
+    {
+        var ast = try std.zig.Ast.parse(allocator, "\"abcd\".*", .zon);
+        defer ast.deinit(allocator);
+        var err: Error = .success;
+        try std.testing.expectError(error.Type, parse(allocator, []const u8, &ast, &err));
+        try std.testing.expectEqualSlices(u8, err.expected_type.name, @typeName([]const u8));
+        const node = err.expected_type.node;
+        const tokens = ast.nodes.items(.main_token);
+        const token = tokens[node];
+        const location = ast.tokenLocation(0, token);
+        try std.testing.expectEqual(Ast.Location{
+            .line = 0,
+            .column = 6,
+            .line_start = 0,
+            .line_end = 8,
+        }, location);
+    }
+
     // Fixed size string literal
     {
-        const parsed = try parseSlice(allocator, [4]u8, "\"ab\\nc\"");
+        const parsed = try parseSlice(allocator, [4]u8, "\"ab\\nc\".*");
         try std.testing.expectEqualSlices(u8, "ab\nc", &parsed);
     }
 
-    // XXX: implement these tests
-    // // Too short
-    // {
-    //     const parsed = try parseSlice(allocator, [3]u8, "\"ab\"");
-    //     try std.testing.expectEqualSlices(u8, "ab\nc", &parsed);
-    // }
+    // Too short
+    {
+        var ast = try std.zig.Ast.parse(allocator, "\"ab\".*", .zon);
+        defer ast.deinit(allocator);
+        var err: Error = .success;
+        try std.testing.expectError(error.Type, parse(allocator, [3]u8, &ast, &err));
+        try std.testing.expectEqualSlices(u8, err.expected_type.name, @typeName([3]u8));
+        const node = err.expected_type.node;
+        const tokens = ast.nodes.items(.main_token);
+        const token = tokens[node];
+        const location = ast.tokenLocation(0, token);
+        try std.testing.expectEqual(Ast.Location{
+            .line = 0,
+            .column = 4,
+            .line_start = 0,
+            .line_end = 6,
+        }, location);
+    }
 
-    // // Too long
-    // {
-    //     const parsed = try parseSlice(allocator, [3]u8, "\"abcd\"");
-    //     try std.testing.expectEqualSlices(u8, "ab\nc", &parsed);
-    // }
-
-    // XXX: mutable vs non mutable (allowed?), freeing, limited size strings etc
-    // XXX: allow references to literals or no?
+    // Too long
+    {
+        var ast = try std.zig.Ast.parse(allocator, "\"abcd\".*", .zon);
+        defer ast.deinit(allocator);
+        var err: Error = .success;
+        try std.testing.expectError(error.Type, parse(allocator, [3]u8, &ast, &err));
+        try std.testing.expectEqualSlices(u8, err.expected_type.name, @typeName([3]u8));
+        const node = err.expected_type.node;
+        const tokens = ast.nodes.items(.main_token);
+        const token = tokens[node];
+        const location = ast.tokenLocation(0, token);
+        try std.testing.expectEqual(Ast.Location{
+            .line = 0,
+            .column = 6,
+            .line_start = 0,
+            .line_end = 8,
+        }, location);
+    }
 }
 
 // TODO: cannot represent not quite right error for unknown field right?
@@ -279,7 +372,6 @@ test "numeric enum literals" {
         defer ast.deinit(allocator);
         var err: Error = .success;
         try std.testing.expectError(error.Type, parse(allocator, Enum, &ast, &err));
-        // XXX: use expect slice for these
         try std.testing.expectEqualSlices(u8, err.cannot_represent.name, @typeName(Enum));
         const node = err.cannot_represent.node;
         const tokens = ast.nodes.items(.main_token);
