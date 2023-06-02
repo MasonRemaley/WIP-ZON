@@ -53,6 +53,10 @@ pub fn parseFree(allocator: Allocator, value: anytype) void {
         // TODO: chase pointer once that's implemented
         // TODO: free vs desotry?
         .Pointer => return allocator.free(value),
+        // TODO: test this!
+        .Array => for (value) |item| {
+            parseFree(allocator, item);
+        },
         else => unreachable,
     }
 }
@@ -90,16 +94,11 @@ fn parsePointer(self: *Parser, comptime T: type, node: NodeIndex) error{ OutOfMe
 }
 
 // XXX: WIP:
-// - to store a string literal in an array, we should need .*
-//      + allow & and .* in general or no?
-//      + would be convenient to allow capped size strings to be stored inline
-// - assuming string literal syntax, not supporting other types of arrays right now
-// - 0 termination?
 // - wide strings?
-// - are single chars valid in place of string literals?
 // - we have to handle invalid string literals here, the parser doesn't catch those errors in advance
 //   right?
 // - error handling ehre not really implemented yet, lots of debug mode assertions for now
+// - other types of pointers? unknown lengths? pointer to array?
 fn parseStringLiteral(self: *Parser, comptime T: type, node: NodeIndex) !T {
     switch (@typeInfo(T)) {
         .Pointer => |Pointer| {
@@ -107,12 +106,37 @@ fn parseStringLiteral(self: *Parser, comptime T: type, node: NodeIndex) !T {
             const token = tokens[node];
             const raw_string = self.ast.tokenSlice(token);
 
-            comptime assert(Pointer.size == .Slice);
+            // comptime assert(Pointer.size == .Slice); // XXX: ...
             comptime assert(Pointer.child == u8);
             if (!Pointer.is_const) {
                 return self.failExpectedType(T, node);
             }
-            return std.zig.string_literal.parseAlloc(self.allocator, raw_string) catch unreachable;
+            const result = std.zig.string_literal.parseAlloc(self.allocator, raw_string) catch unreachable;
+            errdefer self.allocator.free(result); // XXX: can this double free if resize or such fails?
+
+            // XXX: pointer.size??
+
+            if (Pointer.sentinel) |sentinel| {
+                comptime assert(@ptrCast(*const u8, sentinel).* == 0); // XXX: ...
+
+                // XXX: why can't I use from owned slice for this?
+                // var temp = std.ArrayListUnmanaged(u8).fromOwnedSlice(result);
+                // errdefer temp.deinit(self.allocator);
+                // try temp.append(self.allocator, 0);
+                // return temp.items[0 .. temp.items.len - 1 :0];
+
+                var zt = result;
+                if (!self.allocator.resize(result, result.len + 1)) {
+                    zt = try self.allocator.alloc(u8, result.len + 1);
+                    zt.len -= 1;
+                    @memcpy(zt, result);
+                    self.allocator.free(result);
+                }
+                zt.ptr[zt.len] = 0;
+                return zt.ptr[0..zt.len :0];
+            } else {
+                return result;
+            }
         },
         .Array => |Array| {
             const data = self.ast.nodes.items(.data);
@@ -251,6 +275,22 @@ test "string literal" {
             .line_start = 0,
             .line_end = 8,
         }, location);
+    }
+
+    // Zero termianted slices
+    {
+        const parsed: [:0]const u8 = try parseSlice(allocator, [:0]const u8, "\"abc\"");
+        defer parseFree(allocator, parsed);
+        try std.testing.expectEqualSlices(u8, "abc", parsed);
+        try std.testing.expectEqual(@as(u8, 0), parsed[3]);
+    }
+
+    // Zero termianted arrays
+    {
+        const parsed = try parseSlice(allocator, [3:0]u8, "\"abc\".*");
+        defer parseFree(allocator, parsed);
+        try std.testing.expectEqualSlices(u8, "abc", &parsed);
+        try std.testing.expectEqual(@as(u8, 0), parsed[3]);
     }
 }
 
