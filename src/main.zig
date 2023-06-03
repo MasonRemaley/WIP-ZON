@@ -6,6 +6,7 @@ const TokenIndex = std.zig.Ast.TokenIndex;
 const Type = std.builtin.Type;
 const Base = std.zig.number_literal.Base;
 const FloatBase = std.zig.number_literal.FloatBase;
+const StringLiteralError = std.zig.string_literal.Error;
 const assert = std.debug.assert;
 
 const Parser = @This();
@@ -25,6 +26,11 @@ pub const Error = union(enum) {
     cannot_represent: struct {
         name: []const u8,
         node: NodeIndex,
+    },
+    // TODO: doesn't point to specific character right now
+    invalid_string_literal: struct {
+        node: NodeIndex,
+        reason: StringLiteralError,
     },
 };
 
@@ -94,7 +100,6 @@ fn parsePointer(self: *Parser, comptime T: type, node: NodeIndex) error{ OutOfMe
 }
 
 // XXX: WIP:
-// - wide strings?
 // - we have to handle invalid string literals here, the parser doesn't catch those errors in advance
 //   right?
 // - error handling ehre not really implemented yet, lots of debug mode assertions for now
@@ -104,38 +109,37 @@ fn parseStringLiteral(self: *Parser, comptime T: type, node: NodeIndex) !T {
         .Pointer => |Pointer| {
             const tokens = self.ast.nodes.items(.main_token);
             const token = tokens[node];
-            const raw_string = self.ast.tokenSlice(token);
+            const raw = self.ast.tokenSlice(token);
 
             // comptime assert(Pointer.size == .Slice); // XXX: ...
             comptime assert(Pointer.child == u8);
             if (!Pointer.is_const) {
                 return self.failExpectedType(T, node);
             }
-            const result = std.zig.string_literal.parseAlloc(self.allocator, raw_string) catch unreachable;
-            errdefer self.allocator.free(result); // XXX: can this double free if resize or such fails?
+            var buf = std.ArrayList(u8).init(self.allocator);
+            defer buf.deinit();
+            switch (try std.zig.string_literal.parseWrite(buf.writer(), raw)) {
+                .success => {},
+                .failure => |reason| return self.failInvalidStringLiteral(node, reason),
+            }
 
             // XXX: pointer.size??
 
             if (Pointer.sentinel) |sentinel| {
                 comptime assert(@ptrCast(*const u8, sentinel).* == 0); // XXX: ...
 
-                // XXX: why can't I use from owned slice for this?
+                // XXX: why couldn't I use from owned slice for this before when it was getting converted
+                // back and forth?
                 // var temp = std.ArrayListUnmanaged(u8).fromOwnedSlice(result);
                 // errdefer temp.deinit(self.allocator);
                 // try temp.append(self.allocator, 0);
                 // return temp.items[0 .. temp.items.len - 1 :0];
 
-                var zt = result;
-                if (!self.allocator.resize(result, result.len + 1)) {
-                    zt = try self.allocator.alloc(u8, result.len + 1);
-                    zt.len -= 1;
-                    @memcpy(zt, result);
-                    self.allocator.free(result);
-                }
-                zt.ptr[zt.len] = 0;
-                return zt.ptr[0..zt.len :0];
+                try buf.append(0);
+                const result = try buf.toOwnedSlice();
+                return result[0 .. result.len - 1 :0];
             } else {
-                return result;
+                return buf.toOwnedSlice();
             }
         },
         .Array => |Array| {
@@ -143,16 +147,22 @@ fn parseStringLiteral(self: *Parser, comptime T: type, node: NodeIndex) !T {
             const literal = data[node].lhs;
             const tokens = self.ast.nodes.items(.main_token);
             const token = tokens[literal];
-            const raw_string = self.ast.tokenSlice(token);
+            const raw = self.ast.tokenSlice(token);
 
             var result: T = undefined;
             var fsw = std.io.fixedBufferStream(&result);
-            _ = std.zig.string_literal.parseWrite(fsw.writer(), raw_string) catch |e| switch (e) {
+            const status = std.zig.string_literal.parseWrite(fsw.writer(), raw) catch |e| switch (e) {
                 error.NoSpaceLeft => return self.failExpectedType(T, node),
             };
+            switch (status) {
+                .success => {},
+                .failure => |reason| return self.failInvalidStringLiteral(literal, reason),
+            }
             if (Array.len != fsw.pos) {
                 return self.failExpectedType(T, node);
             }
+            // XXX: sentintels
+
             return result;
         },
         else => unreachable,
@@ -291,6 +301,42 @@ test "string literal" {
         defer parseFree(allocator, parsed);
         try std.testing.expectEqualSlices(u8, "abc", &parsed);
         try std.testing.expectEqual(@as(u8, 0), parsed[3]);
+    }
+
+    // Invalid string literal
+    {
+        var ast = try std.zig.Ast.parse(allocator, "\"\\a\"", .zon);
+        defer ast.deinit(allocator);
+        var err: Error = .success;
+        try std.testing.expectError(error.Type, parse(allocator, []const u8, &ast, &err));
+        const node = err.invalid_string_literal.node;
+        const tokens = ast.nodes.items(.main_token);
+        const token = tokens[node];
+        const location = ast.tokenLocation(0, token);
+        try std.testing.expectEqual(Ast.Location{
+            .line = 0,
+            .column = 0,
+            .line_start = 0,
+            .line_end = 4,
+        }, location);
+    }
+
+    // Invalid string literal as array
+    {
+        var ast = try std.zig.Ast.parse(allocator, "\"\\a\".*", .zon);
+        defer ast.deinit(allocator);
+        var err: Error = .success;
+        try std.testing.expectError(error.Type, parse(allocator, [1]u8, &ast, &err));
+        const node = err.invalid_string_literal.node;
+        const tokens = ast.nodes.items(.main_token);
+        const token = tokens[node];
+        const location = ast.tokenLocation(0, token);
+        try std.testing.expectEqual(Ast.Location{
+            .line = 0,
+            .column = 0,
+            .line_start = 0,
+            .line_end = 6,
+        }, location);
     }
 }
 
@@ -494,6 +540,14 @@ fn fail(self: *Parser, err: Error) error{Type} {
         e.* = err;
     }
     return error.Type;
+}
+
+fn failInvalidStringLiteral(self: *Parser, node: NodeIndex, reason: StringLiteralError) error{Type} {
+    @setCold(true);
+    return self.fail(.{ .invalid_string_literal = .{
+        .node = node,
+        .reason = reason,
+    } });
 }
 
 fn failExpectedType(self: *Parser, comptime T: type, node: NodeIndex) error{Type} {
