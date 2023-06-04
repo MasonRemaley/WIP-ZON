@@ -15,7 +15,6 @@ allocator: Allocator,
 ast: *const Ast,
 err: ?*Error,
 
-// XXX: naming?
 // TODO: make a render errors function...handle underlines as well as point of error like zig? How?
 pub const Error = union(enum) {
     success: void,
@@ -83,9 +82,7 @@ pub fn parseExpr(self: *Parser, comptime T: type, node: NodeIndex) error{ OutOfM
 fn parseArray(self: *Parser, comptime T: type, node: NodeIndex) error{Type}!T {
     const tags = self.ast.nodes.items(.tag);
     return switch (tags[node]) {
-        // XXX: support other arrays?
         .deref => try self.parseStringLiteral(T, node),
-        // XXX: support other array syntaxes!
         else => return self.failExpectedType(T, node),
     };
 }
@@ -94,16 +91,10 @@ fn parsePointer(self: *Parser, comptime T: type, node: NodeIndex) error{ OutOfMe
     const tags = self.ast.nodes.items(.tag);
     return switch (tags[node]) {
         .string_literal => try self.parseStringLiteral(T, node),
-        // XXX: support other pointer syntaxes!
         else => return self.failExpectedType(T, node),
     };
 }
 
-// XXX: WIP:
-// - we have to handle invalid string literals here, the parser doesn't catch those errors in advance
-//   right?
-// - error handling ehre not really implemented yet, lots of debug mode assertions for now
-// - other types of pointers? unknown lengths? pointer to array?
 fn parseStringLiteral(self: *Parser, comptime T: type, node: NodeIndex) !T {
     switch (@typeInfo(T)) {
         .Pointer => |Pointer| {
@@ -111,44 +102,58 @@ fn parseStringLiteral(self: *Parser, comptime T: type, node: NodeIndex) !T {
             const token = tokens[node];
             const raw = self.ast.tokenSlice(token);
 
-            // comptime assert(Pointer.size == .Slice); // XXX: ...
-            comptime assert(Pointer.child == u8);
-            if (!Pointer.is_const) {
+            if (Pointer.child != u8 or !Pointer.is_const or Pointer.alignment != 1) {
                 return self.failExpectedType(T, node);
             }
-            var buf = std.ArrayList(u8).init(self.allocator);
-            defer buf.deinit();
-            switch (try std.zig.string_literal.parseWrite(buf.writer(), raw)) {
+            var buf = std.ArrayListUnmanaged(u8){};
+            defer buf.deinit(self.allocator);
+            switch (try std.zig.string_literal.parseWrite(buf.writer(self.allocator), raw)) {
                 .success => {},
                 .failure => |reason| return self.failInvalidStringLiteral(node, reason),
             }
 
-            // XXX: pointer.size??
+            const slice = if (Pointer.sentinel) |sentinel| b: {
+                if (@ptrCast(*const u8, sentinel).* != 0) {
+                    return self.failExpectedType(T, node);
+                }
 
-            if (Pointer.sentinel) |sentinel| {
-                comptime assert(@ptrCast(*const u8, sentinel).* == 0); // XXX: ...
-
-                // XXX: why couldn't I use from owned slice for this before when it was getting converted
+                // TODO: why couldn't I use from owned slice for this before when it was getting converted
                 // back and forth?
                 // var temp = std.ArrayListUnmanaged(u8).fromOwnedSlice(result);
                 // errdefer temp.deinit(self.allocator);
                 // try temp.append(self.allocator, 0);
                 // return temp.items[0 .. temp.items.len - 1 :0];
 
-                try buf.append(0);
-                const result = try buf.toOwnedSlice();
-                return result[0 .. result.len - 1 :0];
-            } else {
-                return buf.toOwnedSlice();
+                try buf.append(self.allocator, 0);
+                const result = try buf.toOwnedSlice(self.allocator);
+                break :b result[0 .. result.len - 1 :0];
+            } else try buf.toOwnedSlice(self.allocator);
+            errdefer self.allocator.free(slice);
+
+            switch (Pointer.size) {
+                .Slice => return slice,
+                .Many, .C => return slice.ptr,
+                .One => return self.failExpectedType(T, node),
             }
         },
         .Array => |Array| {
+            if (Array.sentinel) |sentinel| {
+                if (@ptrCast(*const u8, sentinel).* != 0) {
+                    return self.failExpectedType(T, node);
+                }
+            }
+
+            if (Array.child != u8) {
+                return self.failExpectedType(T, node);
+            }
+
             const data = self.ast.nodes.items(.data);
             const literal = data[node].lhs;
             const tokens = self.ast.nodes.items(.main_token);
             const token = tokens[literal];
             const raw = self.ast.tokenSlice(token);
 
+            // TODO: are undefined zero terminated arrays still terminated?
             var result: T = undefined;
             var fsw = std.io.fixedBufferStream(&result);
             const status = std.zig.string_literal.parseWrite(fsw.writer(), raw) catch |e| switch (e) {
@@ -161,7 +166,6 @@ fn parseStringLiteral(self: *Parser, comptime T: type, node: NodeIndex) !T {
             if (Array.len != fsw.pos) {
                 return self.failExpectedType(T, node);
             }
-            // XXX: sentintels
 
             return result;
         },
@@ -249,6 +253,12 @@ test "string literal" {
         try std.testing.expectEqualSlices(u8, "ab\nc", &parsed);
     }
 
+    // Fixed size string literal
+    {
+        const parsed = try parseSlice(allocator, [4]u8, "\"ab\\nc\".*");
+        try std.testing.expectEqualSlices(u8, "ab\nc", &parsed);
+    }
+
     // Too short
     {
         var ast = try std.zig.Ast.parse(allocator, "\"ab\".*", .zon);
@@ -295,12 +305,50 @@ test "string literal" {
         try std.testing.expectEqual(@as(u8, 0), parsed[3]);
     }
 
+    // Other value terminated slices
+    {
+        var ast = try std.zig.Ast.parse(allocator, "\"foo\"", .zon);
+        defer ast.deinit(allocator);
+        var err: Error = .success;
+        try std.testing.expectError(error.Type, parse(allocator, [:1]const u8, &ast, &err));
+        try std.testing.expectEqualSlices(u8, err.expected_type.name, @typeName([:1]const u8));
+        const node = err.expected_type.node;
+        const tokens = ast.nodes.items(.main_token);
+        const token = tokens[node];
+        const location = ast.tokenLocation(0, token);
+        try std.testing.expectEqual(Ast.Location{
+            .line = 0,
+            .column = 0,
+            .line_start = 0,
+            .line_end = 5,
+        }, location);
+    }
+
     // Zero termianted arrays
     {
         const parsed = try parseSlice(allocator, [3:0]u8, "\"abc\".*");
         defer parseFree(allocator, parsed);
         try std.testing.expectEqualSlices(u8, "abc", &parsed);
         try std.testing.expectEqual(@as(u8, 0), parsed[3]);
+    }
+
+    // Other value terminated arrays
+    {
+        var ast = try std.zig.Ast.parse(allocator, "\"foo\".*", .zon);
+        defer ast.deinit(allocator);
+        var err: Error = .success;
+        try std.testing.expectError(error.Type, parse(allocator, [3:1]u8, &ast, &err));
+        try std.testing.expectEqualSlices(u8, err.expected_type.name, @typeName([3:1]u8));
+        const node = err.expected_type.node;
+        const tokens = ast.nodes.items(.main_token);
+        const token = tokens[node];
+        const location = ast.tokenLocation(0, token);
+        try std.testing.expectEqual(Ast.Location{
+            .line = 0,
+            .column = 5,
+            .line_start = 0,
+            .line_end = 7,
+        }, location);
     }
 
     // Invalid string literal
@@ -321,7 +369,7 @@ test "string literal" {
         }, location);
     }
 
-    // Invalid string literal as array
+    // Invalid array literal
     {
         var ast = try std.zig.Ast.parse(allocator, "\"\\a\".*", .zon);
         defer ast.deinit(allocator);
@@ -338,6 +386,112 @@ test "string literal" {
             .line_end = 6,
         }, location);
     }
+
+    // Array wrong child type
+    {
+        var ast = try std.zig.Ast.parse(allocator, "\"a\".*", .zon);
+        defer ast.deinit(allocator);
+        var err: Error = .success;
+        try std.testing.expectError(error.Type, parse(allocator, [3]i8, &ast, &err));
+        try std.testing.expectEqualSlices(u8, err.expected_type.name, @typeName([3]i8));
+        const node = err.expected_type.node;
+        const tokens = ast.nodes.items(.main_token);
+        const token = tokens[node];
+        const location = ast.tokenLocation(0, token);
+        try std.testing.expectEqual(Ast.Location{
+            .line = 0,
+            .column = 3,
+            .line_start = 0,
+            .line_end = 5,
+        }, location);
+    }
+
+    // Slice wrong child type
+    {
+        var ast = try std.zig.Ast.parse(allocator, "\"a\"", .zon);
+        defer ast.deinit(allocator);
+        var err: Error = .success;
+        try std.testing.expectError(error.Type, parse(allocator, []const i8, &ast, &err));
+        try std.testing.expectEqualSlices(u8, err.expected_type.name, @typeName([]const i8));
+        const node = err.expected_type.node;
+        const tokens = ast.nodes.items(.main_token);
+        const token = tokens[node];
+        const location = ast.tokenLocation(0, token);
+        try std.testing.expectEqual(Ast.Location{
+            .line = 0,
+            .column = 0,
+            .line_start = 0,
+            .line_end = 3,
+        }, location);
+    }
+
+    // Single item pointers
+    {
+        var ast = try std.zig.Ast.parse(allocator, "\"a\"", .zon);
+        defer ast.deinit(allocator);
+        var err: Error = .success;
+        try std.testing.expectError(error.Type, parse(allocator, *const u8, &ast, &err));
+        try std.testing.expectEqualSlices(u8, err.expected_type.name, @typeName(*const u8));
+        const node = err.expected_type.node;
+        const tokens = ast.nodes.items(.main_token);
+        const token = tokens[node];
+        const location = ast.tokenLocation(0, token);
+        try std.testing.expectEqual(Ast.Location{
+            .line = 0,
+            .column = 0,
+            .line_start = 0,
+            .line_end = 3,
+        }, location);
+    }
+
+    // Many item pointers
+    {
+        const parsed = try parseSlice(allocator, [*]const u8, "\"abc\"");
+        defer allocator.free(parsed[0..3]);
+        try std.testing.expectEqualSlices(u8, "abc", parsed[0..3]);
+    }
+
+    // Many item pointers with sentinels
+    {
+        const parsed = try parseSlice(allocator, [*:0]const u8, "\"abc\"");
+        defer allocator.free(parsed[0..4]);
+        try std.testing.expectEqualSlices(u8, "abc", parsed[0..3]);
+        try std.testing.expectEqual(@as(u8, 0), parsed[3]);
+    }
+
+    // C pointers
+    {
+        const parsed = try parseSlice(allocator, [*c]const u8, "\"abc\"");
+        defer allocator.free(parsed[0..3]);
+        try std.testing.expectEqualSlices(u8, "abc", parsed[0..3]);
+    }
+
+    // Bad alignment
+    {
+        var ast = try std.zig.Ast.parse(allocator, "\"abc\"", .zon);
+        defer ast.deinit(allocator);
+        var err: Error = .success;
+        try std.testing.expectError(error.Type, parse(allocator, []align(2) const u8, &ast, &err));
+        try std.testing.expectEqualSlices(u8, err.expected_type.name, @typeName([]align(2) const u8));
+        const node = err.expected_type.node;
+        const tokens = ast.nodes.items(.main_token);
+        const token = tokens[node];
+        const location = ast.tokenLocation(0, token);
+        try std.testing.expectEqual(Ast.Location{
+            .line = 0,
+            .column = 0,
+            .line_start = 0,
+            .line_end = 5,
+        }, location);
+    }
+
+    // TODO: ...
+    // // Multi line strins
+    // {
+    //     const parsed = try parseSlice(allocator, []const u8, "\\foo\\bar");
+    //     defer parseFree(allocator, parsed);
+    //     try std.testing.expectEqualSlices(u8, "foo\nbar", parsed);
+    // }
 }
 
 // TODO: cannot represent not quite right error for unknown field right?
@@ -531,10 +685,10 @@ test "numeric enum literals" {
     // TODO: name general purpose allocators gpa!
 }
 
-// XXX: How do I free the results if failure occurs?
+// TODO: How do I free the results if failure occurs?
 fn fail(self: *Parser, err: Error) error{Type} {
     @setCold(true);
-    // XXX: ...commented out cause of dup error handling
+    // TODO: ...commented out cause of dup error handling
     // assert(self.err == null);
     if (self.err) |e| {
         e.* = err;
