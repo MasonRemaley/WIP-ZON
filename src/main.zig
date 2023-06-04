@@ -46,7 +46,7 @@ pub fn parse(allocator: Allocator, comptime T: type, ast: *const Ast, err: ?*Err
 }
 
 test "error literals" {
-    // XXX: can't return error!error, i think, so we need to use an out param, or not support this...
+    // TODO: can't return error!error, i think, so we need to use an out param, or not support this...
     // const allocator = std.testing.allocator;
     // const parsed = try parseSlice(allocator, anyerror, "error.Foo");
     // try std.testing.expectEqual(error.Foo, parsed);
