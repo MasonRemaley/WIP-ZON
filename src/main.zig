@@ -80,18 +80,9 @@ pub fn parseExpr(self: *Parser, comptime T: type, node: NodeIndex) error{ OutOfM
         .Enum => return self.parseEnumLiteral(T, node),
         // TODO: combined for now for strings...
         .Pointer => return self.parsePointer(T, node),
-        .Array => return self.parseArray(T, node),
         // TODO: keep in sync with parseFree
         else => unreachable,
     }
-}
-
-fn parseArray(self: *Parser, comptime T: type, node: NodeIndex) error{Type}!T {
-    const tags = self.ast.nodes.items(.tag);
-    return switch (tags[node]) {
-        .deref => try self.parseStringLiteral(T, node),
-        else => return self.failExpectedType(T, node),
-    };
 }
 
 fn parsePointer(self: *Parser, comptime T: type, node: NodeIndex) error{ OutOfMemory, Type }!T {
@@ -216,94 +207,6 @@ test "string literal" {
         }, location);
     }
 
-    // Passing slice to fixed size array
-    {
-        var ast = try std.zig.Ast.parse(allocator, "\"abcd\"", .zon);
-        defer ast.deinit(allocator);
-        var err: Error = .success;
-        try std.testing.expectError(error.Type, parse(allocator, [4]u8, &ast, &err));
-        try std.testing.expectEqualSlices(u8, err.expected_type.name, @typeName([4]u8));
-        const node = err.expected_type.node;
-        const tokens = ast.nodes.items(.main_token);
-        const token = tokens[node];
-        const location = ast.tokenLocation(0, token);
-        try std.testing.expectEqual(Ast.Location{
-            .line = 0,
-            .column = 0,
-            .line_start = 0,
-            .line_end = 6,
-        }, location);
-    }
-
-    // Passing fixed slice array, expected slice
-    {
-        var ast = try std.zig.Ast.parse(allocator, "\"abcd\".*", .zon);
-        defer ast.deinit(allocator);
-        var err: Error = .success;
-        try std.testing.expectError(error.Type, parse(allocator, []const u8, &ast, &err));
-        try std.testing.expectEqualSlices(u8, err.expected_type.name, @typeName([]const u8));
-        const node = err.expected_type.node;
-        const tokens = ast.nodes.items(.main_token);
-        const token = tokens[node];
-        const location = ast.tokenLocation(0, token);
-        try std.testing.expectEqual(Ast.Location{
-            .line = 0,
-            .column = 6,
-            .line_start = 0,
-            .line_end = 8,
-        }, location);
-    }
-
-    // Fixed size string literal
-    {
-        const parsed = try parseSlice(allocator, [4]u8, "\"ab\\nc\".*");
-        try std.testing.expectEqualSlices(u8, "ab\nc", &parsed);
-    }
-
-    // Fixed size string literal
-    {
-        const parsed = try parseSlice(allocator, [4]u8, "\"ab\\nc\".*");
-        try std.testing.expectEqualSlices(u8, "ab\nc", &parsed);
-    }
-
-    // Too short
-    {
-        var ast = try std.zig.Ast.parse(allocator, "\"ab\".*", .zon);
-        defer ast.deinit(allocator);
-        var err: Error = .success;
-        try std.testing.expectError(error.Type, parse(allocator, [3]u8, &ast, &err));
-        try std.testing.expectEqualSlices(u8, err.expected_type.name, @typeName([3]u8));
-        const node = err.expected_type.node;
-        const tokens = ast.nodes.items(.main_token);
-        const token = tokens[node];
-        const location = ast.tokenLocation(0, token);
-        try std.testing.expectEqual(Ast.Location{
-            .line = 0,
-            .column = 4,
-            .line_start = 0,
-            .line_end = 6,
-        }, location);
-    }
-
-    // Too long
-    {
-        var ast = try std.zig.Ast.parse(allocator, "\"abcd\".*", .zon);
-        defer ast.deinit(allocator);
-        var err: Error = .success;
-        try std.testing.expectError(error.Type, parse(allocator, [3]u8, &ast, &err));
-        try std.testing.expectEqualSlices(u8, err.expected_type.name, @typeName([3]u8));
-        const node = err.expected_type.node;
-        const tokens = ast.nodes.items(.main_token);
-        const token = tokens[node];
-        const location = ast.tokenLocation(0, token);
-        try std.testing.expectEqual(Ast.Location{
-            .line = 0,
-            .column = 6,
-            .line_start = 0,
-            .line_end = 8,
-        }, location);
-    }
-
     // Zero termianted slices
     {
         const parsed: [:0]const u8 = try parseSlice(allocator, [:0]const u8, "\"abc\"");
@@ -331,33 +234,6 @@ test "string literal" {
         }, location);
     }
 
-    // Zero termianted arrays
-    {
-        const parsed = try parseSlice(allocator, [3:0]u8, "\"abc\".*");
-        defer parseFree(allocator, parsed);
-        try std.testing.expectEqualSlices(u8, "abc", &parsed);
-        try std.testing.expectEqual(@as(u8, 0), parsed[3]);
-    }
-
-    // Other value terminated arrays
-    {
-        var ast = try std.zig.Ast.parse(allocator, "\"foo\".*", .zon);
-        defer ast.deinit(allocator);
-        var err: Error = .success;
-        try std.testing.expectError(error.Type, parse(allocator, [3:1]u8, &ast, &err));
-        try std.testing.expectEqualSlices(u8, err.expected_type.name, @typeName([3:1]u8));
-        const node = err.expected_type.node;
-        const tokens = ast.nodes.items(.main_token);
-        const token = tokens[node];
-        const location = ast.tokenLocation(0, token);
-        try std.testing.expectEqual(Ast.Location{
-            .line = 0,
-            .column = 5,
-            .line_start = 0,
-            .line_end = 7,
-        }, location);
-    }
-
     // Invalid string literal
     {
         var ast = try std.zig.Ast.parse(allocator, "\"\\a\"", .zon);
@@ -373,43 +249,6 @@ test "string literal" {
             .column = 0,
             .line_start = 0,
             .line_end = 4,
-        }, location);
-    }
-
-    // Invalid array literal
-    {
-        var ast = try std.zig.Ast.parse(allocator, "\"\\a\".*", .zon);
-        defer ast.deinit(allocator);
-        var err: Error = .success;
-        try std.testing.expectError(error.Type, parse(allocator, [1]u8, &ast, &err));
-        const node = err.invalid_string_literal.node;
-        const tokens = ast.nodes.items(.main_token);
-        const token = tokens[node];
-        const location = ast.tokenLocation(0, token);
-        try std.testing.expectEqual(Ast.Location{
-            .line = 0,
-            .column = 0,
-            .line_start = 0,
-            .line_end = 6,
-        }, location);
-    }
-
-    // Array wrong child type
-    {
-        var ast = try std.zig.Ast.parse(allocator, "\"a\".*", .zon);
-        defer ast.deinit(allocator);
-        var err: Error = .success;
-        try std.testing.expectError(error.Type, parse(allocator, [3]i8, &ast, &err));
-        try std.testing.expectEqualSlices(u8, err.expected_type.name, @typeName([3]i8));
-        const node = err.expected_type.node;
-        const tokens = ast.nodes.items(.main_token);
-        const token = tokens[node];
-        const location = ast.tokenLocation(0, token);
-        try std.testing.expectEqual(Ast.Location{
-            .line = 0,
-            .column = 3,
-            .line_start = 0,
-            .line_end = 5,
         }, location);
     }
 
