@@ -74,14 +74,221 @@ pub fn parseFree(allocator: Allocator, value: anytype) void {
 }
 
 pub fn parseExpr(self: *Parser, comptime T: type, node: NodeIndex) error{ OutOfMemory, Type }!T {
+    // TODO: keep in sync with parseFree
     switch (@typeInfo(T)) {
+        // TODO: better errors for this?
         .Bool => return self.parseBool(node),
         .Int, .Float => return self.parseNumber(T, node),
         .Enum => return self.parseEnumLiteral(T, node),
         // TODO: combined for now for strings...
         .Pointer => return self.parsePointer(T, node),
-        // TODO: keep in sync with parseFree
-        else => unreachable,
+        .Array => return self.parseArray(T, node),
+
+        // TODO: ...
+        // .EnumLiteral
+        // .Union
+        // .ErrorUnion
+        // .ErrorStruct
+        // .Optional
+        // .Struct
+        // .Array
+
+        else => @compileError("unable to parse into type " ++ @typeName(T)),
+    }
+}
+
+fn parseArray(self: *Parser, comptime T: type, node: NodeIndex) error{ OutOfMemory, Type }!T {
+    const Array = @typeInfo(T).Array;
+    var result: T = undefined;
+
+    const tags = self.ast.nodes.items(.tag);
+    return switch (tags[node]) {
+        // Size zero
+        .struct_init_dot_two => {
+            if (Array.len != 0) {
+                return self.failExpectedType(T, node);
+            }
+            return result;
+        },
+        // Size one or two
+        .array_init_dot_two_comma, .array_init_dot_two => {
+            const data = self.ast.nodes.items(.data);
+            const lhs = data[node].lhs;
+            const rhs = data[node].rhs;
+
+            switch (Array.len) {
+                1 => if (rhs != 0) {
+                    return self.failExpectedType(T, node);
+                },
+                2 => if (rhs == 0) {
+                    return self.failExpectedType(T, node);
+                },
+                else => return self.failExpectedType(T, node),
+            }
+
+            result[0] = try self.parseExpr(Array.child, lhs);
+            if (Array.len > 1) {
+                result[1] = try self.parseExpr(Array.child, rhs);
+            }
+
+            return result;
+        },
+        // Size > 2
+        .array_init_dot => {
+            const data = self.ast.nodes.items(.data);
+            const lhs = data[node].lhs;
+            const rhs = data[node].rhs;
+            const items = self.ast.extra_data[lhs..rhs];
+
+            if (Array.len != items.len) {
+                return self.failExpectedType(T, node);
+            }
+
+            for (0..Array.len) |i| {
+                result[i] = try self.parseExpr(Array.child, items[i]);
+            }
+
+            return result;
+        },
+        else => return self.failExpectedType(T, node),
+    };
+}
+
+// Test sizes 0 to 3 since small sizes get parsed differently
+test "array" {
+    const allocator = std.testing.allocator;
+
+    // Array literals
+    {
+        const zero = try parseSlice(allocator, [0]u8, ".{}");
+        try std.testing.expectEqualSlices(u8, &@as([0]u8, .{}), &zero);
+
+        const one = try parseSlice(allocator, [1]u8, ".{'a'}");
+        try std.testing.expectEqualSlices(u8, &@as([1]u8, .{'a'}), &one);
+
+        const two = try parseSlice(allocator, [2]u8, ".{'a', 'b'}");
+        try std.testing.expectEqualSlices(u8, &@as([2]u8, .{ 'a', 'b' }), &two);
+
+        const three = try parseSlice(allocator, [3]u8, ".{'a', 'b', 'c'}");
+        try std.testing.expectEqualSlices(u8, &.{ 'a', 'b', 'c' }, &three);
+
+        const sentinel = try parseSlice(allocator, [3:'z']u8, ".{'a', 'b', 'c'}");
+        const expected_sentinel: [3:'z']u8 = .{ 'a', 'b', 'c' };
+        try std.testing.expectEqualSlices(u8, &expected_sentinel, &sentinel);
+    }
+
+    // Expect 0 find 3
+    {
+        var ast = try std.zig.Ast.parse(allocator, ".{'a', 'b', 'c'}", .zon);
+        defer ast.deinit(allocator);
+        var err: Error = .success;
+        try std.testing.expectError(error.Type, parse(allocator, [0]u8, &ast, &err));
+        try std.testing.expectEqualSlices(u8, err.expected_type.name, @typeName([0]u8));
+        const node = err.expected_type.node;
+        const tokens = ast.nodes.items(.main_token);
+        const token = tokens[node];
+        const location = ast.tokenLocation(0, token);
+        try std.testing.expectEqual(Ast.Location{
+            .line = 0,
+            .column = 1,
+            .line_start = 0,
+            .line_end = 16,
+        }, location);
+    }
+
+    // Expect 1 find 2
+    {
+        var ast = try std.zig.Ast.parse(allocator, ".{'a', 'b'}", .zon);
+        defer ast.deinit(allocator);
+        var err: Error = .success;
+        try std.testing.expectError(error.Type, parse(allocator, [1]u8, &ast, &err));
+        try std.testing.expectEqualSlices(u8, err.expected_type.name, @typeName([1]u8));
+        const node = err.expected_type.node;
+        const tokens = ast.nodes.items(.main_token);
+        const token = tokens[node];
+        const location = ast.tokenLocation(0, token);
+        try std.testing.expectEqual(Ast.Location{
+            .line = 0,
+            .column = 1,
+            .line_start = 0,
+            .line_end = 11,
+        }, location);
+    }
+
+    // Expect 2 find 1
+    {
+        var ast = try std.zig.Ast.parse(allocator, ".{'a'}", .zon);
+        defer ast.deinit(allocator);
+        var err: Error = .success;
+        try std.testing.expectError(error.Type, parse(allocator, [2]u8, &ast, &err));
+        try std.testing.expectEqualSlices(u8, err.expected_type.name, @typeName([2]u8));
+        const node = err.expected_type.node;
+        const tokens = ast.nodes.items(.main_token);
+        const token = tokens[node];
+        const location = ast.tokenLocation(0, token);
+        try std.testing.expectEqual(Ast.Location{
+            .line = 0,
+            .column = 1,
+            .line_start = 0,
+            .line_end = 6,
+        }, location);
+    }
+
+    // Expect 3 find 0
+    {
+        var ast = try std.zig.Ast.parse(allocator, ".{}", .zon);
+        defer ast.deinit(allocator);
+        var err: Error = .success;
+        try std.testing.expectError(error.Type, parse(allocator, [3]u8, &ast, &err));
+        try std.testing.expectEqualSlices(u8, err.expected_type.name, @typeName([3]u8));
+        const node = err.expected_type.node;
+        const tokens = ast.nodes.items(.main_token);
+        const token = tokens[node];
+        const location = ast.tokenLocation(0, token);
+        try std.testing.expectEqual(Ast.Location{
+            .line = 0,
+            .column = 1,
+            .line_start = 0,
+            .line_end = 3,
+        }, location);
+    }
+
+    // Wrong inner type
+    {
+        var ast = try std.zig.Ast.parse(allocator, ".{'a', 'b', 'c'}", .zon);
+        defer ast.deinit(allocator);
+        var err: Error = .success;
+        try std.testing.expectError(error.Type, parse(allocator, [3]bool, &ast, &err));
+        try std.testing.expectEqualSlices(u8, err.expected_type.name, @typeName(bool));
+        const node = err.expected_type.node;
+        const tokens = ast.nodes.items(.main_token);
+        const token = tokens[node];
+        const location = ast.tokenLocation(0, token);
+        try std.testing.expectEqual(Ast.Location{
+            .line = 0,
+            .column = 2,
+            .line_start = 0,
+            .line_end = 16,
+        }, location);
+    }
+
+    // Complete wrong type
+    {
+        var ast = try std.zig.Ast.parse(allocator, "'a'", .zon);
+        defer ast.deinit(allocator);
+        var err: Error = .success;
+        try std.testing.expectError(error.Type, parse(allocator, [3]u8, &ast, &err));
+        try std.testing.expectEqualSlices(u8, err.expected_type.name, @typeName([3]u8));
+        const node = err.expected_type.node;
+        const tokens = ast.nodes.items(.main_token);
+        const token = tokens[node];
+        const location = ast.tokenLocation(0, token);
+        try std.testing.expectEqual(Ast.Location{
+            .line = 0,
+            .column = 0,
+            .line_start = 0,
+            .line_end = 3,
+        }, location);
     }
 }
 
@@ -89,6 +296,7 @@ fn parsePointer(self: *Parser, comptime T: type, node: NodeIndex) error{ OutOfMe
     const tags = self.ast.nodes.items(.tag);
     return switch (tags[node]) {
         .string_literal => try self.parseStringLiteral(T, node),
+        // TODO: support slices... .address_of
         else => return self.failExpectedType(T, node),
     };
 }
