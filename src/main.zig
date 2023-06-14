@@ -62,14 +62,23 @@ pub fn parseSlice(allocator: Allocator, comptime T: type, source: [:0]const u8) 
 pub fn parseFree(allocator: Allocator, value: anytype) void {
     switch (@typeInfo(@TypeOf(value))) {
         .Bool, .Int, .Float, .Enum => {},
-        // TODO: chase pointer once that's implemented
-        // TODO: free vs desotry?
-        .Pointer => return allocator.free(value),
-        // TODO: test this!
+        .Pointer => {
+            switch (@typeInfo(@TypeOf(value)).Pointer.size) {
+                .One => parseFree(allocator, value.*),
+                // TODO: ...
+                .Many, .C => @compileError("unsupported type"),
+                // TODO: sentinels?
+                .Slice => for (value) |item| {
+                    parseFree(allocator, item);
+                },
+            }
+            return allocator.free(value);
+        },
         .Array => for (value) |item| {
             parseFree(allocator, item);
         },
-        else => unreachable,
+        // TODO: ...
+        else => @compileError("unsupported type"),
     }
 }
 
@@ -90,91 +99,163 @@ pub fn parseExpr(self: *Parser, comptime T: type, node: NodeIndex) error{ OutOfM
         // .ErrorUnion
         // .ErrorStruct
         // .Optional
-        // .Struct
-        // .Array
+        // .Struct // TODO: make sure to support tuples too!
 
-        else => @compileError("unable to parse into type " ++ @typeName(T)),
+        else => failToParseType(T),
     }
 }
 
 fn parseArray(self: *Parser, comptime T: type, node: NodeIndex) error{ OutOfMemory, Type }!T {
     const Array = @typeInfo(T).Array;
-    var result: T = undefined;
+    const len = try self.arrayLength(T, node);
+    if (Array.len != len) {
+        return self.failExpectedType(T, node);
+    }
+    var buf: T = undefined;
+    try self.parseArrayItems(Array.child, node, &buf);
+    return buf;
+}
 
+fn temp(foo: []const u8) u8 {
+    return foo[3];
+}
+
+// TODO: slice indexes are only bounds checked in debug mode right? (we don't want bounds checking
+// here, we know it's big enough)
+// buf.len assumed to be `arrayLength(node)`
+fn parseArrayItems(
+    self: *Parser,
+    comptime T: type,
+    node: NodeIndex,
+    buf: anytype,
+) error{ OutOfMemory, Type }!void {
     const tags = self.ast.nodes.items(.tag);
-    return switch (tags[node]) {
-        // Size zero
-        .struct_init_dot_two => {
-            if (Array.len != 0) {
-                return self.failExpectedType(T, node);
-            }
-            return result;
-        },
-        // Size one or two
+    switch (tags[node]) {
+        .struct_init_dot_two => {},
         .array_init_dot_two_comma, .array_init_dot_two => {
             const data = self.ast.nodes.items(.data);
             const lhs = data[node].lhs;
             const rhs = data[node].rhs;
 
-            switch (Array.len) {
-                1 => if (rhs != 0) {
-                    return self.failExpectedType(T, node);
-                },
-                2 => if (rhs == 0) {
-                    return self.failExpectedType(T, node);
-                },
-                else => return self.failExpectedType(T, node),
+            if (buf.len > 0) {
+                buf[0] = try self.parseExpr(T, lhs);
+                if (buf.len > 1) {
+                    buf[1] = try self.parseExpr(T, rhs);
+                }
             }
-
-            result[0] = try self.parseExpr(Array.child, lhs);
-            if (Array.len > 1) {
-                result[1] = try self.parseExpr(Array.child, rhs);
-            }
-
-            return result;
         },
-        // Size > 2
         .array_init_dot => {
             const data = self.ast.nodes.items(.data);
             const lhs = data[node].lhs;
             const rhs = data[node].rhs;
             const items = self.ast.extra_data[lhs..rhs];
 
-            if (Array.len != items.len) {
-                return self.failExpectedType(T, node);
+            for (buf, items) |*item_buf, item_node| {
+                item_buf.* = try self.parseExpr(T, item_node);
             }
-
-            for (0..Array.len) |i| {
-                result[i] = try self.parseExpr(Array.child, items[i]);
-            }
-
-            return result;
         },
-        else => return self.failExpectedType(T, node),
-    };
+        // This case should already be caught by arrayLength
+        else => unreachable,
+    }
+}
+
+test "slice" {
+    const allocator = std.testing.allocator;
+
+    {
+        const zero = try parseSlice(allocator, []u8, "&.{}");
+        defer parseFree(allocator, zero);
+        try std.testing.expectEqualSlices(u8, @as([]u8, &.{}), zero);
+    }
 }
 
 // Test sizes 0 to 3 since small sizes get parsed differently
-test "array" {
+test "arrays and slices" {
     const allocator = std.testing.allocator;
 
-    // Array literals
+    // Literals
     {
-        const zero = try parseSlice(allocator, [0]u8, ".{}");
-        try std.testing.expectEqualSlices(u8, &@as([0]u8, .{}), &zero);
+        // Arrays
+        {
+            const zero = try parseSlice(allocator, [0]u8, ".{}");
+            try std.testing.expectEqualSlices(u8, &@as([0]u8, .{}), &zero);
 
-        const one = try parseSlice(allocator, [1]u8, ".{'a'}");
-        try std.testing.expectEqualSlices(u8, &@as([1]u8, .{'a'}), &one);
+            const one = try parseSlice(allocator, [1]u8, ".{'a'}");
+            try std.testing.expectEqualSlices(u8, &@as([1]u8, .{'a'}), &one);
 
-        const two = try parseSlice(allocator, [2]u8, ".{'a', 'b'}");
-        try std.testing.expectEqualSlices(u8, &@as([2]u8, .{ 'a', 'b' }), &two);
+            const two = try parseSlice(allocator, [2]u8, ".{'a', 'b'}");
+            try std.testing.expectEqualSlices(u8, &@as([2]u8, .{ 'a', 'b' }), &two);
 
-        const three = try parseSlice(allocator, [3]u8, ".{'a', 'b', 'c'}");
-        try std.testing.expectEqualSlices(u8, &.{ 'a', 'b', 'c' }, &three);
+            const three = try parseSlice(allocator, [3]u8, ".{'a', 'b', 'c'}");
+            try std.testing.expectEqualSlices(u8, &.{ 'a', 'b', 'c' }, &three);
 
-        const sentinel = try parseSlice(allocator, [3:'z']u8, ".{'a', 'b', 'c'}");
-        const expected_sentinel: [3:'z']u8 = .{ 'a', 'b', 'c' };
-        try std.testing.expectEqualSlices(u8, &expected_sentinel, &sentinel);
+            const sentinel = try parseSlice(allocator, [3:'z']u8, ".{'a', 'b', 'c'}");
+            const expected_sentinel: [3:'z']u8 = .{ 'a', 'b', 'c' };
+            try std.testing.expectEqualSlices(u8, &expected_sentinel, &sentinel);
+        }
+
+        // Slice literals
+        {
+            const zero = try parseSlice(allocator, []const u8, "&.{}");
+            defer parseFree(allocator, zero);
+            try std.testing.expectEqualSlices(u8, @as([]const u8, &.{}), zero);
+
+            const one = try parseSlice(allocator, []u8, "&.{'a'}");
+            defer parseFree(allocator, one);
+            try std.testing.expectEqualSlices(u8, &.{'a'}, one);
+
+            const two = try parseSlice(allocator, []const u8, "&.{'a', 'b'}");
+            defer parseFree(allocator, two);
+            try std.testing.expectEqualSlices(u8, &.{ 'a', 'b' }, two);
+
+            const three = try parseSlice(allocator, []u8, "&.{'a', 'b', 'c'}");
+            defer parseFree(allocator, three);
+            try std.testing.expectEqualSlices(u8, &.{ 'a', 'b', 'c' }, three);
+
+            const sentinel = try parseSlice(allocator, [:'z']const u8, "&.{'a', 'b', 'c'}");
+            defer parseFree(allocator, sentinel);
+            const expected_sentinel: [:'z']const u8 = &.{ 'a', 'b', 'c' };
+            try std.testing.expectEqualSlices(u8, expected_sentinel, sentinel);
+        }
+    }
+
+    // Deep free
+    {
+        // Arrays
+        {
+            const parsed = try parseSlice(allocator, [1][]const u8, ".{\"abc\"}");
+            defer parseFree(allocator, parsed);
+            const expected: [1][]const u8 = .{"abc"};
+            try std.testing.expectEqualDeep(expected, parsed);
+        }
+
+        // Slice literals
+        {
+            const parsed = try parseSlice(allocator, []const []const u8, "&.{\"abc\"}");
+            defer parseFree(allocator, parsed);
+            const expected: []const []const u8 = &.{"abc"};
+            try std.testing.expectEqualDeep(expected, parsed);
+        }
+    }
+
+    // Senintels and alignment
+    {
+        // Arrays
+        {
+            const sentinel = try parseSlice(allocator, [1:2]u8, ".{1}");
+            try std.testing.expectEqual(@as(usize, 1), sentinel.len);
+            try std.testing.expectEqual(@as(u8, 1), sentinel[0]);
+            try std.testing.expectEqual(@as(u8, 2), sentinel[1]);
+        }
+
+        // Slice literals
+        {
+            const sentinel = try parseSlice(allocator, [:2]align(4) u8, "&.{1}");
+            defer parseFree(allocator, sentinel);
+            try std.testing.expectEqual(@as(usize, 1), sentinel.len);
+            try std.testing.expectEqual(@as(u8, 1), sentinel[0]);
+            try std.testing.expectEqual(@as(u8, 2), sentinel[1]);
+        }
     }
 
     // Expect 0 find 3
@@ -183,7 +264,7 @@ test "array" {
         defer ast.deinit(allocator);
         var err: Error = .success;
         try std.testing.expectError(error.Type, parse(allocator, [0]u8, &ast, &err));
-        try std.testing.expectEqualSlices(u8, err.expected_type.name, @typeName([0]u8));
+        try std.testing.expectEqualStrings(@typeName([0]u8), err.expected_type.name);
         const node = err.expected_type.node;
         const tokens = ast.nodes.items(.main_token);
         const token = tokens[node];
@@ -202,7 +283,7 @@ test "array" {
         defer ast.deinit(allocator);
         var err: Error = .success;
         try std.testing.expectError(error.Type, parse(allocator, [1]u8, &ast, &err));
-        try std.testing.expectEqualSlices(u8, err.expected_type.name, @typeName([1]u8));
+        try std.testing.expectEqualStrings(@typeName([1]u8), err.expected_type.name);
         const node = err.expected_type.node;
         const tokens = ast.nodes.items(.main_token);
         const token = tokens[node];
@@ -221,7 +302,7 @@ test "array" {
         defer ast.deinit(allocator);
         var err: Error = .success;
         try std.testing.expectError(error.Type, parse(allocator, [2]u8, &ast, &err));
-        try std.testing.expectEqualSlices(u8, err.expected_type.name, @typeName([2]u8));
+        try std.testing.expectEqualStrings(@typeName([2]u8), err.expected_type.name);
         const node = err.expected_type.node;
         const tokens = ast.nodes.items(.main_token);
         const token = tokens[node];
@@ -240,7 +321,7 @@ test "array" {
         defer ast.deinit(allocator);
         var err: Error = .success;
         try std.testing.expectError(error.Type, parse(allocator, [3]u8, &ast, &err));
-        try std.testing.expectEqualSlices(u8, err.expected_type.name, @typeName([3]u8));
+        try std.testing.expectEqualStrings(@typeName([3]u8), err.expected_type.name);
         const node = err.expected_type.node;
         const tokens = ast.nodes.items(.main_token);
         const token = tokens[node];
@@ -255,55 +336,173 @@ test "array" {
 
     // Wrong inner type
     {
-        var ast = try std.zig.Ast.parse(allocator, ".{'a', 'b', 'c'}", .zon);
-        defer ast.deinit(allocator);
-        var err: Error = .success;
-        try std.testing.expectError(error.Type, parse(allocator, [3]bool, &ast, &err));
-        try std.testing.expectEqualSlices(u8, err.expected_type.name, @typeName(bool));
-        const node = err.expected_type.node;
-        const tokens = ast.nodes.items(.main_token);
-        const token = tokens[node];
-        const location = ast.tokenLocation(0, token);
-        try std.testing.expectEqual(Ast.Location{
-            .line = 0,
-            .column = 2,
-            .line_start = 0,
-            .line_end = 16,
-        }, location);
+        // Array
+        {
+            var ast = try std.zig.Ast.parse(allocator, ".{'a', 'b', 'c'}", .zon);
+            defer ast.deinit(allocator);
+            var err: Error = .success;
+            try std.testing.expectError(error.Type, parse(allocator, [3]bool, &ast, &err));
+            try std.testing.expectEqualStrings(@typeName(bool), err.expected_type.name);
+            const node = err.expected_type.node;
+            const tokens = ast.nodes.items(.main_token);
+            const token = tokens[node];
+            const location = ast.tokenLocation(0, token);
+            try std.testing.expectEqual(Ast.Location{
+                .line = 0,
+                .column = 2,
+                .line_start = 0,
+                .line_end = 16,
+            }, location);
+        }
+
+        // Slice
+        {
+            var ast = try std.zig.Ast.parse(allocator, "&.{'a', 'b', 'c'}", .zon);
+            defer ast.deinit(allocator);
+            var err: Error = .success;
+            try std.testing.expectError(error.Type, parse(allocator, []bool, &ast, &err));
+            try std.testing.expectEqualStrings(@typeName(bool), err.expected_type.name);
+            const node = err.expected_type.node;
+            const tokens = ast.nodes.items(.main_token);
+            const token = tokens[node];
+            const location = ast.tokenLocation(0, token);
+            try std.testing.expectEqual(Ast.Location{
+                .line = 0,
+                .column = 3,
+                .line_start = 0,
+                .line_end = 17,
+            }, location);
+        }
     }
 
     // Complete wrong type
     {
-        var ast = try std.zig.Ast.parse(allocator, "'a'", .zon);
-        defer ast.deinit(allocator);
-        var err: Error = .success;
-        try std.testing.expectError(error.Type, parse(allocator, [3]u8, &ast, &err));
-        try std.testing.expectEqualSlices(u8, err.expected_type.name, @typeName([3]u8));
-        const node = err.expected_type.node;
-        const tokens = ast.nodes.items(.main_token);
-        const token = tokens[node];
-        const location = ast.tokenLocation(0, token);
-        try std.testing.expectEqual(Ast.Location{
-            .line = 0,
-            .column = 0,
-            .line_start = 0,
-            .line_end = 3,
-        }, location);
+        // Array
+        {
+            var ast = try std.zig.Ast.parse(allocator, "'a'", .zon);
+            defer ast.deinit(allocator);
+            var err: Error = .success;
+            try std.testing.expectError(error.Type, parse(allocator, [3]u8, &ast, &err));
+            try std.testing.expectEqualStrings(@typeName([3]u8), err.expected_type.name);
+            const node = err.expected_type.node;
+            const tokens = ast.nodes.items(.main_token);
+            const token = tokens[node];
+            const location = ast.tokenLocation(0, token);
+            try std.testing.expectEqual(Ast.Location{
+                .line = 0,
+                .column = 0,
+                .line_start = 0,
+                .line_end = 3,
+            }, location);
+        }
+
+        // Slice
+        {
+            var ast = try std.zig.Ast.parse(allocator, "'a'", .zon);
+            defer ast.deinit(allocator);
+            var err: Error = .success;
+            try std.testing.expectError(error.Type, parse(allocator, []u8, &ast, &err));
+            try std.testing.expectEqualStrings(@typeName([]u8), err.expected_type.name);
+            const node = err.expected_type.node;
+            const tokens = ast.nodes.items(.main_token);
+            const token = tokens[node];
+            const location = ast.tokenLocation(0, token);
+            try std.testing.expectEqual(Ast.Location{
+                .line = 0,
+                .column = 0,
+                .line_start = 0,
+                .line_end = 3,
+            }, location);
+        }
+    }
+
+    // Mixing up arrays and slices
+    {
+        // Array
+        {
+            var ast = try std.zig.Ast.parse(allocator, "&.{'a', 'b', 'c'}", .zon);
+            defer ast.deinit(allocator);
+            var err: Error = .success;
+            try std.testing.expectError(error.Type, parse(allocator, [3]bool, &ast, &err));
+            try std.testing.expectEqualStrings(@typeName([3]bool), err.expected_type.name);
+            const node = err.expected_type.node;
+            const tokens = ast.nodes.items(.main_token);
+            const token = tokens[node];
+            const location = ast.tokenLocation(0, token);
+            try std.testing.expectEqual(Ast.Location{
+                .line = 0,
+                .column = 0,
+                .line_start = 0,
+                .line_end = 17,
+            }, location);
+        }
+
+        // Slice
+        {
+            var ast = try std.zig.Ast.parse(allocator, ".{'a', 'b', 'c'}", .zon);
+            defer ast.deinit(allocator);
+            var err: Error = .success;
+            try std.testing.expectError(error.Type, parse(allocator, []bool, &ast, &err));
+            try std.testing.expectEqualStrings(@typeName([]bool), err.expected_type.name);
+            const node = err.expected_type.node;
+            const tokens = ast.nodes.items(.main_token);
+            const token = tokens[node];
+            const location = ast.tokenLocation(0, token);
+            try std.testing.expectEqual(Ast.Location{
+                .line = 0,
+                .column = 1,
+                .line_start = 0,
+                .line_end = 16,
+            }, location);
+        }
     }
 }
 
 fn parsePointer(self: *Parser, comptime T: type, node: NodeIndex) error{ OutOfMemory, Type }!T {
     const tags = self.ast.nodes.items(.tag);
+    const data = self.ast.nodes.items(.data);
     return switch (tags[node]) {
         .string_literal => try self.parseStringLiteral(T, node),
-        // TODO: support slices... .address_of
-        else => return self.failExpectedType(T, node),
+        .address_of => try self.parseAddressOf(T, data[node].lhs),
+        else => self.failExpectedType(T, node),
     };
+}
+
+fn arrayLength(self: *Parser, comptime T: type, node: NodeIndex) error{ OutOfMemory, Type }!usize {
+    const tags = self.ast.nodes.items(.tag);
+    const data = self.ast.nodes.items(.data);
+    return switch (tags[node]) {
+        .struct_init_dot_two => 0,
+        .array_init_dot_two_comma, .array_init_dot_two => if (data[node].rhs == 0) 1 else 2,
+        .array_init_dot => data[node].rhs - data[node].lhs,
+        else => self.failExpectedType(T, node),
+    };
+}
+
+fn parseAddressOf(self: *Parser, comptime T: type, node: NodeIndex) error{ OutOfMemory, Type }!T {
+    const Pointer = @typeInfo(T).Pointer;
+    // TODO: it may make sense to support coercing into these even though it won't often be used, since
+    // zig does, so it's consistent. Not gonna bother for now though can revisit later and decide.
+    switch (Pointer.size) {
+        .One, .Many, .C => failToParseType(T),
+        .Slice => {},
+    }
+
+    const len = try self.arrayLength(T, node);
+    const sentinel = if (Pointer.sentinel) |s| @ptrCast(*const Pointer.child, s).* else null;
+    var buf = try self.allocator.allocWithOptions(Pointer.child, len, Pointer.alignment, sentinel);
+    errdefer self.allocator.free(buf);
+    try self.parseArrayItems(Pointer.child, node, buf);
+    return buf;
 }
 
 fn parseStringLiteral(self: *Parser, comptime T: type, node: NodeIndex) !T {
     switch (@typeInfo(T)) {
         .Pointer => |Pointer| {
+            if (Pointer.size != .Slice) {
+                failToParseType(T);
+            }
+
             const tokens = self.ast.nodes.items(.main_token);
             const token = tokens[node];
             const raw = self.ast.tokenSlice(token);
@@ -318,7 +517,7 @@ fn parseStringLiteral(self: *Parser, comptime T: type, node: NodeIndex) !T {
                 .failure => |reason| return self.failInvalidStringLiteral(node, reason),
             }
 
-            const slice = if (Pointer.sentinel) |sentinel| b: {
+            if (Pointer.sentinel) |sentinel| {
                 if (@ptrCast(*const u8, sentinel).* != 0) {
                     return self.failExpectedType(T, node);
                 }
@@ -331,16 +530,12 @@ fn parseStringLiteral(self: *Parser, comptime T: type, node: NodeIndex) !T {
                 // return temp.items[0 .. temp.items.len - 1 :0];
 
                 try buf.append(self.allocator, 0);
+                // TODO: doesn't alloc right?
                 const result = try buf.toOwnedSlice(self.allocator);
-                break :b result[0 .. result.len - 1 :0];
-            } else try buf.toOwnedSlice(self.allocator);
-            errdefer self.allocator.free(slice);
-
-            switch (Pointer.size) {
-                .Slice => return slice,
-                .Many, .C => return slice.ptr,
-                .One => return self.failExpectedType(T, node),
+                return result[0 .. result.len - 1 :0];
             }
+
+            return try buf.toOwnedSlice(self.allocator);
         },
         .Array => |Array| {
             if (Array.sentinel) |sentinel| {
@@ -402,7 +597,7 @@ test "string literal" {
         defer ast.deinit(allocator);
         var err: Error = .success;
         try std.testing.expectError(error.Type, parse(allocator, []u8, &ast, &err));
-        try std.testing.expectEqualSlices(u8, err.expected_type.name, @typeName([]u8));
+        try std.testing.expectEqualStrings(@typeName([]u8), err.expected_type.name);
         const node = err.expected_type.node;
         const tokens = ast.nodes.items(.main_token);
         const token = tokens[node];
@@ -429,7 +624,7 @@ test "string literal" {
         defer ast.deinit(allocator);
         var err: Error = .success;
         try std.testing.expectError(error.Type, parse(allocator, [:1]const u8, &ast, &err));
-        try std.testing.expectEqualSlices(u8, err.expected_type.name, @typeName([:1]const u8));
+        try std.testing.expectEqualStrings(@typeName([:1]const u8), err.expected_type.name);
         const node = err.expected_type.node;
         const tokens = ast.nodes.items(.main_token);
         const token = tokens[node];
@@ -466,7 +661,7 @@ test "string literal" {
         defer ast.deinit(allocator);
         var err: Error = .success;
         try std.testing.expectError(error.Type, parse(allocator, []const i8, &ast, &err));
-        try std.testing.expectEqualSlices(u8, err.expected_type.name, @typeName([]const i8));
+        try std.testing.expectEqualStrings(@typeName([]const i8), err.expected_type.name);
         const node = err.expected_type.node;
         const tokens = ast.nodes.items(.main_token);
         const token = tokens[node];
@@ -477,47 +672,6 @@ test "string literal" {
             .line_start = 0,
             .line_end = 3,
         }, location);
-    }
-
-    // Single item pointers
-    {
-        var ast = try std.zig.Ast.parse(allocator, "\"a\"", .zon);
-        defer ast.deinit(allocator);
-        var err: Error = .success;
-        try std.testing.expectError(error.Type, parse(allocator, *const u8, &ast, &err));
-        try std.testing.expectEqualSlices(u8, err.expected_type.name, @typeName(*const u8));
-        const node = err.expected_type.node;
-        const tokens = ast.nodes.items(.main_token);
-        const token = tokens[node];
-        const location = ast.tokenLocation(0, token);
-        try std.testing.expectEqual(Ast.Location{
-            .line = 0,
-            .column = 0,
-            .line_start = 0,
-            .line_end = 3,
-        }, location);
-    }
-
-    // Many item pointers
-    {
-        const parsed = try parseSlice(allocator, [*]const u8, "\"abc\"");
-        defer allocator.free(parsed[0..3]);
-        try std.testing.expectEqualSlices(u8, "abc", parsed[0..3]);
-    }
-
-    // Many item pointers with sentinels
-    {
-        const parsed = try parseSlice(allocator, [*:0]const u8, "\"abc\"");
-        defer allocator.free(parsed[0..4]);
-        try std.testing.expectEqualSlices(u8, "abc", parsed[0..3]);
-        try std.testing.expectEqual(@as(u8, 0), parsed[3]);
-    }
-
-    // C pointers
-    {
-        const parsed = try parseSlice(allocator, [*c]const u8, "\"abc\"");
-        defer allocator.free(parsed[0..3]);
-        try std.testing.expectEqualSlices(u8, "abc", parsed[0..3]);
     }
 
     // Bad alignment
@@ -526,7 +680,7 @@ test "string literal" {
         defer ast.deinit(allocator);
         var err: Error = .success;
         try std.testing.expectError(error.Type, parse(allocator, []align(2) const u8, &ast, &err));
-        try std.testing.expectEqualSlices(u8, err.expected_type.name, @typeName([]align(2) const u8));
+        try std.testing.expectEqualStrings(@typeName([]align(2) const u8), err.expected_type.name);
         const node = err.expected_type.node;
         const tokens = ast.nodes.items(.main_token);
         const token = tokens[node];
@@ -627,7 +781,7 @@ test "enum literals" {
         defer ast.deinit(allocator);
         var err: Error = .success;
         try std.testing.expectError(error.Type, parse(allocator, Enum, &ast, &err));
-        try std.testing.expectEqualSlices(u8, err.expected_type.name, @typeName(Enum));
+        try std.testing.expectEqualStrings(@typeName(Enum), err.expected_type.name);
         const node = err.expected_type.node;
         const tokens = ast.nodes.items(.main_token);
         const token = tokens[node];
@@ -774,6 +928,10 @@ fn failCannotRepresent(self: *Parser, comptime T: type, node: NodeIndex) error{T
     } });
 }
 
+fn failToParseType(comptime T: type) noreturn {
+    @compileError("unable to parse into type " ++ @typeName(T));
+}
+
 fn parseBool(self: *Parser, node: NodeIndex) error{Type}!bool {
     const tags = self.ast.nodes.items(.tag);
     const tokens = self.ast.nodes.items(.main_token);
@@ -805,7 +963,7 @@ test "parse bool" {
         defer ast.deinit(allocator);
         var err: Error = .success;
         try std.testing.expectError(error.Type, parse(allocator, bool, &ast, &err));
-        try std.testing.expectEqualSlices(u8, err.expected_type.name, @typeName(bool));
+        try std.testing.expectEqualStrings(@typeName(bool), err.expected_type.name);
         const node = err.expected_type.node;
         const tokens = ast.nodes.items(.main_token);
         const token = tokens[node];
@@ -822,7 +980,7 @@ test "parse bool" {
         defer ast.deinit(allocator);
         var err: Error = .success;
         try std.testing.expectError(error.Type, parse(allocator, bool, &ast, &err));
-        try std.testing.expectEqualSlices(u8, err.expected_type.name, @typeName(bool));
+        try std.testing.expectEqualStrings(@typeName(bool), err.expected_type.name);
         const node = err.expected_type.node;
         const tokens = ast.nodes.items(.main_token);
         const token = tokens[node];
@@ -1172,7 +1330,7 @@ test "parse int" {
         defer ast.deinit(allocator);
         var err: Error = .success;
         try std.testing.expectError(error.Type, parse(allocator, u8, &ast, &err));
-        try std.testing.expectEqualSlices(u8, err.expected_type.name, @typeName(u8));
+        try std.testing.expectEqualStrings(@typeName(u8), err.expected_type.name);
         const node = err.expected_type.node;
         const tokens = ast.nodes.items(.main_token);
         const token = tokens[node];
