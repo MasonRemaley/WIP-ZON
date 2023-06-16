@@ -33,12 +33,12 @@ pub const Error = union(enum) {
     },
     unknown_field: struct {
         node: NodeIndex,
-        struct_name: []const u8,
+        type_name: []const u8,
         field_name: []const u8,
     },
     missing_field: struct {
         node: NodeIndex,
-        struct_name: []const u8,
+        type_name: []const u8,
         field_name: []const u8,
     },
 };
@@ -70,10 +70,12 @@ pub fn parseSlice(allocator: Allocator, comptime T: type, source: [:0]const u8) 
 }
 
 pub fn parseFree(allocator: Allocator, value: anytype) void {
-    switch (@typeInfo(@TypeOf(value))) {
+    const Value = @TypeOf(value);
+
+    switch (@typeInfo(Value)) {
         .Bool, .Int, .Float, .Enum => {},
-        .Pointer => {
-            switch (@typeInfo(@TypeOf(value)).Pointer.size) {
+        .Pointer => |Pointer| {
+            switch (Pointer.size) {
                 .One => parseFree(allocator, value.*),
                 // TODO: ...
                 .Many, .C => @compileError("unsupported type"),
@@ -90,8 +92,18 @@ pub fn parseFree(allocator: Allocator, value: anytype) void {
         .Struct => |Struct| inline for (Struct.fields) |field| {
             parseFree(allocator, @field(value, field.name));
         },
+        .Union => |Union| {
+            const Tag = Union.tag_type orelse failFreeType(Value);
+            inline for (@typeInfo(Tag).Enum.fields, 0..) |field, i| {
+                const tag = @intToEnum(Tag, i);
+                if (value == tag) {
+                    parseFree(allocator, @field(value, field.name));
+                    break;
+                }
+            }
+        },
         // TODO: ...
-        else => @compileError("unsupported type"),
+        else => failFreeType(Value),
     }
 }
 
@@ -109,6 +121,7 @@ pub fn parseExpr(self: *Parser, comptime T: type, node: NodeIndex) error{ OutOfM
             return self.parseTuple(T, node)
         else
             return self.parseStruct(T, node),
+        .Union => return self.parseUnion(T, node),
 
         // TODO: ...
         // .EnumLiteral
@@ -118,6 +131,145 @@ pub fn parseExpr(self: *Parser, comptime T: type, node: NodeIndex) error{ OutOfM
         // .Optional
 
         else => failToParseType(T),
+    }
+}
+
+fn parseUnion(self: *Parser, comptime T: type, node: NodeIndex) error{ OutOfMemory, Type }!T {
+    // TODO: some of the array errors point to the brace instead of 0?
+    const Union = @typeInfo(T).Union;
+    const field_infos = Union.fields;
+
+    if (field_infos.len == 0) {
+        failToParseType(T);
+    }
+
+    // Gather info on the fields
+    const field_indices = b: {
+        comptime var kvs_list: [field_infos.len]struct { []const u8, usize } = undefined;
+        inline for (field_infos, 0..) |field, i| {
+            kvs_list[i] = .{ field.name, i };
+        }
+        break :b std.ComptimeStringMap(usize, kvs_list);
+    };
+
+    // Parse the union
+    var buf: [2]NodeIndex = undefined;
+    const field_nodes = try self.elementsOrFields(T, &buf, node);
+
+    if (field_nodes.len != 1) {
+        return self.failExpectedType(T, node);
+    }
+
+    // Fill in the field we found
+    const main_tokens = self.ast.nodes.items(.main_token);
+    const field_node = field_nodes[0];
+    const name = self.ast.tokenSlice(main_tokens[field_node] - 2);
+    const i = field_indices.get(name) orelse
+        return self.failUnknownField(T, field_node, name);
+
+    inline for (0..field_infos.len) |j| {
+        if (i == j) {
+            const field_info = field_infos[j];
+            const value = try self.parseExpr(field_info.type, field_node);
+            return @unionInit(T, field_info.name, value);
+        }
+    }
+
+    unreachable;
+}
+
+test "unions" {
+    const allocator = std.testing.allocator;
+
+    // Unions
+    {
+        const Tagged = union(enum) { x: f32, y: bool };
+        const Untagged = union { x: f32, y: bool };
+
+        const tagged_x = try parseSlice(allocator, Tagged, ".{.x = 1.5}");
+        try std.testing.expectEqual(Tagged{ .x = 1.5 }, tagged_x);
+        const tagged_y = try parseSlice(allocator, Tagged, ".{.y = true}");
+        try std.testing.expectEqual(Tagged{ .y = true }, tagged_y);
+
+        const untagged_x = try parseSlice(allocator, Untagged, ".{.x = 1.5}");
+        try std.testing.expect(untagged_x.x == 1.5);
+        const untagged_y = try parseSlice(allocator, Untagged, ".{.y = true}");
+        try std.testing.expect(untagged_y.y);
+    }
+
+    // Deep free
+    {
+        const Union = union(enum) { bar: []const u8, baz: bool };
+
+        const noalloc = try parseSlice(allocator, Union, ".{.baz = false}");
+        try std.testing.expectEqual(Union{ .baz = false }, noalloc);
+
+        const alloc = try parseSlice(allocator, Union, ".{.bar = \"qux\"}");
+        defer parseFree(allocator, alloc);
+        try std.testing.expectEqualDeep(Union{ .bar = "qux" }, alloc);
+    }
+
+    // Unknown field
+    {
+        const Union = struct { x: f32, y: f32 };
+        var ast = try std.zig.Ast.parse(allocator, ".{.z=2.5}", .zon);
+        defer ast.deinit(allocator);
+        var err: Error = .success;
+        try std.testing.expectError(error.Type, parse(allocator, Union, &ast, &err));
+        try std.testing.expectEqualStrings(@typeName(Union), err.unknown_field.type_name);
+        try std.testing.expectEqualStrings("z", err.unknown_field.field_name);
+        const node = err.unknown_field.node;
+        const main_tokens = ast.nodes.items(.main_token);
+        const token = main_tokens[node] - 2;
+        const location = ast.tokenLocation(0, token);
+        try std.testing.expectEqual(Ast.Location{
+            .line = 0,
+            .column = 3,
+            .line_start = 0,
+            .line_end = 9,
+        }, location);
+    }
+
+    // Extra field
+    {
+        const Union = union { x: f32, y: bool };
+        var ast = try std.zig.Ast.parse(allocator, ".{.x = 1.5, .y = true}", .zon);
+        defer ast.deinit(allocator);
+        var err: Error = .success;
+        try std.testing.expectError(error.Type, parse(allocator, Union, &ast, &err));
+        try std.testing.expectEqualStrings(@typeName(Union), err.expected_type.name);
+        const node = err.expected_type.node;
+        const main_tokens = ast.nodes.items(.main_token);
+        const token = main_tokens[node];
+        const location = ast.tokenLocation(0, token);
+        try std.testing.expectEqual(Ast.Location{
+            .line = 0,
+            // TODO: why column 1?
+            .column = 1,
+            .line_start = 0,
+            .line_end = 22,
+        }, location);
+    }
+
+    // No fields
+    {
+        const Union = union { x: f32, y: bool };
+        var ast = try std.zig.Ast.parse(allocator, ".{}", .zon);
+        defer ast.deinit(allocator);
+        var err: Error = .success;
+        try std.testing.expectError(error.Type, parse(allocator, Union, &ast, &err));
+        try std.testing.expectEqualStrings(@typeName(Union), err.expected_type.name);
+        const node = err.expected_type.node;
+        const main_tokens = ast.nodes.items(.main_token);
+        const token = main_tokens[node];
+        const location = ast.tokenLocation(0, token);
+        try std.testing.expectEqual(Ast.Location{
+            .line = 0,
+            // TODO: why column 1?
+            .column = 1,
+            .line_start = 0,
+            .line_end = 3,
+        }, location);
     }
 }
 
@@ -173,6 +325,7 @@ fn parseStruct(self: *Parser, comptime T: type, node: NodeIndex) error{ OutOfMem
                 if (i == j) {
                     const field_info = field_infos[j];
                     @field(result, field_info.name) = try self.parseExpr(field_info.type, field_node);
+                    break;
                 }
             }
 
@@ -237,7 +390,7 @@ test "structs" {
         defer ast.deinit(allocator);
         var err: Error = .success;
         try std.testing.expectError(error.Type, parse(allocator, Vec2, &ast, &err));
-        try std.testing.expectEqualStrings(@typeName(Vec2), err.unknown_field.struct_name);
+        try std.testing.expectEqualStrings(@typeName(Vec2), err.unknown_field.type_name);
         try std.testing.expectEqualStrings("z", err.unknown_field.field_name);
         const node = err.unknown_field.node;
         const main_tokens = ast.nodes.items(.main_token);
@@ -258,7 +411,7 @@ test "structs" {
         defer ast.deinit(allocator);
         var err: Error = .success;
         try std.testing.expectError(error.Type, parse(allocator, Vec2, &ast, &err));
-        try std.testing.expectEqualStrings(@typeName(Vec2), err.missing_field.struct_name);
+        try std.testing.expectEqualStrings(@typeName(Vec2), err.missing_field.type_name);
         try std.testing.expectEqualStrings("y", err.missing_field.field_name);
         const node = err.missing_field.node;
         const main_tokens = ast.nodes.items(.main_token);
@@ -1172,7 +1325,7 @@ fn failUnknownField(self: *Parser, comptime T: type, node: NodeIndex, name: []co
     @setCold(true);
     return self.fail(.{ .unknown_field = .{
         .node = node,
-        .struct_name = @typeName(T),
+        .type_name = @typeName(T),
         .field_name = name,
     } });
 }
@@ -1181,13 +1334,17 @@ fn failMissingField(self: *Parser, comptime T: type, name: []const u8, node: Nod
     @setCold(true);
     return self.fail(.{ .missing_field = .{
         .node = node,
-        .struct_name = @typeName(T),
+        .type_name = @typeName(T),
         .field_name = name,
     } });
 }
 
 fn failToParseType(comptime T: type) noreturn {
     @compileError("unable to parse into type " ++ @typeName(T));
+}
+
+fn failFreeType(comptime T: type) noreturn {
+    @compileError("unable to free type " ++ @typeName(T));
 }
 
 fn parseBool(self: *Parser, node: NodeIndex) error{Type}!bool {
