@@ -102,6 +102,9 @@ pub fn parseFree(allocator: Allocator, value: anytype) void {
                 }
             }
         },
+        .Optional => if (value) |some| {
+            parseFree(allocator, some);
+        },
         // TODO: ...
         else => failFreeType(Value),
     }
@@ -122,15 +125,46 @@ pub fn parseExpr(self: *Parser, comptime T: type, node: NodeIndex) error{ OutOfM
         else
             return self.parseStruct(T, node),
         .Union => return self.parseUnion(T, node),
-
-        // TODO: ...
-        // .EnumLiteral
-        // .Union
-        // .ErrorUnion
-        // .ErrorStruct
-        // .Optional
+        .Optional => return self.parseOptional(T, node),
 
         else => failToParseType(T),
+    }
+}
+
+fn parseOptional(self: *Parser, comptime T: type, node: NodeIndex) error{ OutOfMemory, Type }!T {
+    const Optional = @typeInfo(T).Optional;
+
+    const tags = self.ast.nodes.items(.tag);
+    if (tags[node] == .identifier) {
+        const main_tokens = self.ast.nodes.items(.main_token);
+        const token = main_tokens[node];
+        const bytes = self.ast.tokenSlice(token);
+        if (std.mem.eql(u8, bytes, "null")) {
+            return null;
+        }
+    }
+
+    return try self.parseExpr(Optional.child, node);
+}
+
+test "optional" {
+    const allocator = std.testing.allocator;
+
+    // Basic usage
+    {
+        const none = try parseSlice(allocator, ?u32, "null");
+        try std.testing.expect(none == null);
+        const some = try parseSlice(allocator, ?u32, "1");
+        try std.testing.expect(some.? == 1);
+    }
+
+    // Deep free
+    {
+        const none = try parseSlice(allocator, ?[]const u8, "null");
+        try std.testing.expect(none == null);
+        const some = try parseSlice(allocator, ?[]const u8, "\"foo\"");
+        defer parseFree(allocator, some);
+        try std.testing.expectEqualStrings("foo", some.?);
     }
 }
 
