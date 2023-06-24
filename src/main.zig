@@ -125,8 +125,68 @@ fn parseExpr(self: *Parser, comptime T: type, node: NodeIndex) Error!T {
             return self.parseStruct(T, node),
         .Union => return self.parseUnion(T, node),
         .Optional => return self.parseOptional(T, node),
+        .Void => return self.parseVoid(node),
 
         else => failToParseType(T),
+    }
+}
+
+fn parseVoid(self: *Parser, node: NodeIndex) Error!void {
+    const tags = self.ast.nodes.items(.tag);
+    const data = self.ast.nodes.items(.data);
+    switch (tags[node]) {
+        .block_two => if (data[node].lhs != 0 or data[node].rhs != 0) {
+            return self.failExpectedType(void, node);
+        },
+        .block => if (data[node].lhs != data[node].rhs) {
+            return self.failExpectedType(void, node);
+        },
+        else => return self.failExpectedType(void, node),
+    }
+}
+
+test "void" {
+    const gpa = std.testing.allocator;
+
+    const parsed: void = try parseFromSlice(void, gpa, "{}");
+    _ = parsed;
+
+    // Other type
+    {
+        var ast = try std.zig.Ast.parse(gpa, "123", .zon);
+        defer ast.deinit(gpa);
+        var status: Status = .success;
+        try std.testing.expectError(error.Type, parseFromAst(void, gpa, &ast, &status));
+        try std.testing.expectEqualStrings(@typeName(void), status.expected_type.name);
+        const node = status.expected_type.node;
+        const main_tokens = ast.nodes.items(.main_token);
+        const token = main_tokens[node];
+        const location = ast.tokenLocation(0, token);
+        try std.testing.expectEqual(Ast.Location{
+            .line = 0,
+            .column = 0,
+            .line_start = 0,
+            .line_end = 3,
+        }, location);
+    }
+
+    // Brackets around values (will eventually be parser error)
+    {
+        var ast = try std.zig.Ast.parse(gpa, "{1}", .zon);
+        defer ast.deinit(gpa);
+        var status: Status = .success;
+        try std.testing.expectError(error.Type, parseFromAst(void, gpa, &ast, &status));
+        try std.testing.expectEqualStrings(@typeName(void), status.expected_type.name);
+        const node = status.expected_type.node;
+        const main_tokens = ast.nodes.items(.main_token);
+        const token = main_tokens[node];
+        const location = ast.tokenLocation(0, token);
+        try std.testing.expectEqual(Ast.Location{
+            .line = 0,
+            .column = 0,
+            .line_start = 0,
+            .line_end = 3,
+        }, location);
     }
 }
 
@@ -186,25 +246,51 @@ fn parseUnion(self: *Parser, comptime T: type, node: NodeIndex) Error!T {
     };
 
     // Parse the union
-    var buf: [2]NodeIndex = undefined;
-    const field_nodes = try self.elementsOrFields(T, &buf, node);
-
-    if (field_nodes.len != 1) {
-        return self.failExpectedType(T, node);
-    }
-
-    // Fill in the field we found
     const main_tokens = self.ast.nodes.items(.main_token);
-    const field_node = field_nodes[0];
-    const name = self.ast.tokenSlice(main_tokens[field_node] - 2);
-    const i = field_indices.get(name) orelse
-        return self.failUnknownField(T, field_node, name);
+    const tags = self.ast.nodes.items(.tag);
+    if (tags[node] == .enum_literal) {
+        // The union must be tagged for an enum literal to coerce to it
+        if (Union.tag_type == null) {
+            return self.failExpectedType(T, node);
+        }
 
-    inline for (0..field_infos.len) |j| {
-        if (i == j) {
-            const field_info = field_infos[j];
-            const value = try self.parseExpr(field_info.type, field_node);
-            return @unionInit(T, field_info.name, value);
+        // Get the index of the named field. We don't use `parseEnum` here as
+        // the order of the enum and the order of the union might not match!
+        const bytes = self.ast.tokenSlice(main_tokens[node]);
+        const field_index = field_indices.get(bytes) orelse
+            return self.failUnknownField(T, node, bytes);
+
+        // Initialize the union from the given field.
+        inline for (field_infos, 0..) |field_info, i| {
+            if (i == field_index) {
+                // Fail if the field is not void
+                if (field_info.type != void)
+                    return self.failExpectedType(T, node);
+
+                // Instantiate the union
+                return @unionInit(T, field_info.name, {});
+            }
+        }
+        unreachable;
+    } else {
+        var buf: [2]NodeIndex = undefined;
+        const field_nodes = try self.elementsOrFields(T, &buf, node);
+
+        if (field_nodes.len != 1) {
+            return self.failExpectedType(T, node);
+        }
+
+        // Fill in the field we found
+        const field_node = field_nodes[0];
+        const name = self.ast.tokenSlice(main_tokens[field_node] - 2);
+        const i = field_indices.get(name) orelse
+            return self.failUnknownField(T, field_node, name);
+
+        inline for (field_infos, 0..) |field_info, j| {
+            if (i == j) {
+                const value = try self.parseExpr(field_info.type, field_node);
+                return @unionInit(T, field_info.name, value);
+            }
         }
     }
 
@@ -216,13 +302,17 @@ test "unions" {
 
     // Unions
     {
-        const Tagged = union(enum) { x: f32, y: bool };
-        const Untagged = union { x: f32, y: bool };
+        const Tagged = union(enum) { x: f32, y: bool, z };
+        const Untagged = union { x: f32, y: bool, z: void };
 
         const tagged_x = try parseFromSlice(Tagged, gpa, ".{.x = 1.5}");
         try std.testing.expectEqual(Tagged{ .x = 1.5 }, tagged_x);
         const tagged_y = try parseFromSlice(Tagged, gpa, ".{.y = true}");
         try std.testing.expectEqual(Tagged{ .y = true }, tagged_y);
+        const tagged_z_shorthand = try parseFromSlice(Tagged, gpa, ".z");
+        try std.testing.expectEqual(@as(Tagged, .z), tagged_z_shorthand);
+        const tagged_z_explicit = try parseFromSlice(Tagged, gpa, ".{.z = {}}");
+        try std.testing.expectEqual(Tagged{ .z = {} }, tagged_z_explicit);
 
         const untagged_x = try parseFromSlice(Untagged, gpa, ".{.x = 1.5}");
         try std.testing.expect(untagged_x.x == 1.5);
@@ -244,7 +334,7 @@ test "unions" {
 
     // Unknown field
     {
-        const Union = struct { x: f32, y: f32 };
+        const Union = union { x: f32, y: f32 };
         var ast = try std.zig.Ast.parse(gpa, ".{.z=2.5}", .zon);
         defer ast.deinit(gpa);
         var status: Status = .success;
@@ -304,6 +394,70 @@ test "unions" {
             .line_end = 3,
         }, location);
     }
+
+    // Enum literals cannot coerce into untagged unions
+    {
+        const Union = union { x: void };
+        var ast = try std.zig.Ast.parse(gpa, ".x", .zon);
+        defer ast.deinit(gpa);
+        var status: Status = .success;
+        try std.testing.expectError(error.Type, parseFromAst(Union, gpa, &ast, &status));
+        try std.testing.expectEqualStrings(@typeName(Union), status.expected_type.name);
+        const node = status.expected_type.node;
+        const main_tokens = ast.nodes.items(.main_token);
+        const token = main_tokens[node];
+        const location = ast.tokenLocation(0, token);
+        try std.testing.expectEqual(Ast.Location{
+            .line = 0,
+            // TODO: why column 1?
+            .column = 1,
+            .line_start = 0,
+            .line_end = 2,
+        }, location);
+    }
+
+    // Unknown field for enum literal coercion
+    {
+        const Union = union(enum) { x: void };
+        var ast = try std.zig.Ast.parse(gpa, ".y", .zon);
+        defer ast.deinit(gpa);
+        var status: Status = .success;
+        try std.testing.expectError(error.Type, parseFromAst(Union, gpa, &ast, &status));
+        try std.testing.expectEqualStrings(@typeName(Union), status.unknown_field.type_name);
+        try std.testing.expectEqualStrings("y", status.unknown_field.field_name);
+        const node = status.unknown_field.node;
+        const main_tokens = ast.nodes.items(.main_token);
+        const token = main_tokens[node];
+        const location = ast.tokenLocation(0, token);
+        try std.testing.expectEqual(Ast.Location{
+            .line = 0,
+            // TODO: why 1?
+            .column = 1,
+            .line_start = 0,
+            .line_end = 2,
+        }, location);
+    }
+
+    // Non void field for enum literal coercion
+    {
+        const Union = union(enum) { x: f32 };
+        var ast = try std.zig.Ast.parse(gpa, ".x", .zon);
+        defer ast.deinit(gpa);
+        var status: Status = .success;
+        try std.testing.expectError(error.Type, parseFromAst(Union, gpa, &ast, &status));
+        try std.testing.expectEqualStrings(@typeName(Union), status.expected_type.name);
+        const node = status.expected_type.node;
+        const main_tokens = ast.nodes.items(.main_token);
+        const token = main_tokens[node];
+        const location = ast.tokenLocation(0, token);
+        try std.testing.expectEqual(Ast.Location{
+            .line = 0,
+            // TODO: why column 1?
+            .column = 1,
+            .line_start = 0,
+            .line_end = 2,
+        }, location);
+    }
 }
 
 // TODO: modify the parser instead of using this workaround? (is necessary because arrays of size
@@ -354,9 +508,8 @@ fn parseStruct(self: *Parser, comptime T: type, node: NodeIndex) Error!T {
             const i = field_indices.get(name) orelse
                 return self.failUnknownField(T, field_node, name);
 
-            inline for (0..field_infos.len) |j| {
+            inline for (field_infos, 0..) |field_info, j| {
                 if (i == j) {
-                    const field_info = field_infos[j];
                     @field(result, field_info.name) = try self.parseExpr(field_info.type, field_node);
                     break;
                 }
@@ -1354,6 +1507,7 @@ fn failCannotRepresent(self: *Parser, comptime T: type, node: NodeIndex) error{T
     } });
 }
 
+// TODO: order of node vs name inconsistent with others?
 fn failUnknownField(self: *Parser, comptime T: type, node: NodeIndex, name: []const u8) error{Type} {
     // TODO: should we be using setCold anywhere else?
     @setCold(true);
