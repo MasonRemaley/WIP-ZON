@@ -27,6 +27,11 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
+    // XXX: do i need to explicitly call add module..?
+    _ = b.addModule("zon", .{
+        .source_file = .{ .path = "src/main.zig" },
+    });
+
     // This declares intent for the library to be installed into the standard
     // location when the user invokes the "install" step (the default step when
     // running `zig build`).
