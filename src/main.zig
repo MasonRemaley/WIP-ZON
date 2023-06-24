@@ -104,6 +104,7 @@ pub fn parseFree(gpa: Allocator, value: anytype) void {
         .Optional => if (value) |some| {
             parseFree(gpa, some);
         },
+        .Void => {},
         // TODO: ...
         else => failFreeType(Value),
     }
@@ -150,6 +151,10 @@ test "void" {
 
     const parsed: void = try parseFromSlice(void, gpa, "{}");
     _ = parsed;
+
+    // Freeing void is a noop, but it should compile!
+    const free: void = try parseFromSlice(void, gpa, "{}");
+    defer parseFree(gpa, free);
 
     // Other type
     {
