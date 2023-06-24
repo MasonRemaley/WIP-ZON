@@ -1,5 +1,8 @@
 const std = @import("std");
 
+// Export for use at build time.
+pub const zon = @import("src/main.zig");
+
 // Although this function looks imperative, note that its job is to
 // declaratively construct a build graph that will be executed by an external
 // runner.
