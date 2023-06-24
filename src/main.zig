@@ -94,7 +94,7 @@ pub fn parseFree(gpa: Allocator, value: anytype) void {
         .Union => |Union| {
             const Tag = Union.tag_type orelse failFreeType(Value);
             inline for (@typeInfo(Tag).Enum.fields, 0..) |field, i| {
-                const tag = @intToEnum(Tag, i);
+                const tag = @enumFromInt(Tag, i);
                 if (value == tag) {
                     parseFree(gpa, @field(value, field.name));
                     break;
@@ -1141,6 +1141,7 @@ fn parseEnumNumber(self: *Parser, comptime T: type, node: NodeIndex) error{Type}
     // TODO: kinda weird dup error handling?
     var number = self.parseNumber(@typeInfo(T).Enum.tag_type, node) catch
         return self.failCannotRepresent(T, node);
+    // TODO: should this be renamed too?
     return std.meta.intToEnum(T, number) catch
         self.failCannotRepresent(T, node);
 }
@@ -1150,7 +1151,7 @@ fn parseEnumTag(self: *Parser, comptime T: type, node: NodeIndex) error{Type}!T 
     const enum_fields = @typeInfo(T).Enum.fields;
     comptime var kvs_list: [enum_fields.len]struct { []const u8, T } = undefined;
     inline for (enum_fields, 0..) |field, i| {
-        kvs_list[i] = .{ field.name, @intToEnum(T, field.value) };
+        kvs_list[i] = .{ field.name, @enumFromInt(T, field.value) };
     }
     const tags = std.ComptimeStringMap(T, kvs_list);
 
@@ -1489,14 +1490,14 @@ fn applySignToInt(self: *Parser, comptime T: type, node: NodeIndex, int: anytype
                 },
                 .unsigned => return self.failCannotRepresent(T, node),
             },
-            .Float => return -@intToFloat(T, int),
+            .Float => return -@floatFromInt(T, int),
             else => @compileError("expected numeric type"),
         }
     } else {
         switch (@typeInfo(T)) {
             .Int => return std.math.cast(T, int) orelse
                 self.failCannotRepresent(T, node),
-            .Float => return @intToFloat(T, int),
+            .Float => return @floatFromInt(T, int),
             else => @compileError("expected numeric type"),
         }
     }
@@ -1522,12 +1523,12 @@ fn parseBigInt(self: *Parser, comptime T: type, node: NodeIndex, base: Base) err
     const num_lit_token = main_tokens[num_lit_node];
     // TODO: was wrong, passed in node by mistake! we could edit the ast to make this stuff typesafe..?
     const bytes = self.ast.tokenSlice(num_lit_token);
-    const prefix_offset = @as(u8, 2) * @boolToInt(base != .decimal);
+    const prefix_offset = @as(u8, 2) * @intFromBool(base != .decimal);
     var result: T = 0;
     for (bytes[prefix_offset..]) |char| {
         if (char == '_') continue;
-        const d = std.fmt.charToDigit(char, @enumToInt(base)) catch unreachable;
-        result = std.math.mul(T, result, @intCast(T, @enumToInt(base))) catch
+        const d = std.fmt.charToDigit(char, @intFromEnum(base)) catch unreachable;
+        result = std.math.mul(T, result, @intCast(T, @intFromEnum(base))) catch
             return self.failCannotRepresent(T, node);
         if (self.isNegative(node)) {
             result = std.math.sub(T, result, @intCast(T, d)) catch
@@ -1559,7 +1560,7 @@ fn parseFloat(
     if (T == Float) {
         return result;
     } else {
-        return floatToInt(T, result) orelse
+        return intFromFloat(T, result) orelse
             self.failCannotRepresent(T, node);
     }
 }
@@ -1589,8 +1590,8 @@ fn numLitNode(self: *const Parser, node: NodeIndex) NodeIndex {
     }
 }
 
-// TODO: move to std.math?
-fn floatToInt(comptime T: type, value: anytype) ?T {
+// TODO: move to std.math? did the int equivalent there get renamed to match the builtin style like this too or no?
+fn intFromFloat(comptime T: type, value: anytype) ?T {
     switch (@typeInfo(@TypeOf(value))) {
         .Float, .ComptimeFloat => {},
         else => @compileError(@typeName(@TypeOf(value)) ++ " is not a floating point type"),
@@ -1608,37 +1609,37 @@ fn floatToInt(comptime T: type, value: anytype) ?T {
         return null;
     }
 
-    return @floatToInt(T, value);
+    return @intFromFloat(T, value);
 }
 
-test "floatToInt" {
+test "intFromFloat" {
     // Valid conversions
-    try std.testing.expectEqual(@as(u8, 10), floatToInt(u8, 10.0).?);
-    try std.testing.expectEqual(@as(i8, -123), floatToInt(i8, @as(f64, -123.0)).?);
-    try std.testing.expectEqual(@as(i16, 45), floatToInt(i16, @as(f128, 45.0)).?);
-    try std.testing.expectEqual(@as(comptime_int, 10), comptime floatToInt(i16, @as(f32, 10.0)).?);
+    try std.testing.expectEqual(@as(u8, 10), intFromFloat(u8, 10.0).?);
+    try std.testing.expectEqual(@as(i8, -123), intFromFloat(i8, @as(f64, -123.0)).?);
+    try std.testing.expectEqual(@as(i16, 45), intFromFloat(i16, @as(f128, 45.0)).?);
+    try std.testing.expectEqual(@as(comptime_int, 10), comptime intFromFloat(i16, @as(f32, 10.0)).?);
     try std.testing.expectEqual(
         @as(comptime_int, 10),
-        comptime floatToInt(i16, @as(comptime_float, 10.0)).?,
+        comptime intFromFloat(i16, @as(comptime_float, 10.0)).?,
     );
-    try std.testing.expectEqual(@as(u8, 5), floatToInt(u8, @as(comptime_float, 5.0)).?);
+    try std.testing.expectEqual(@as(u8, 5), intFromFloat(u8, @as(comptime_float, 5.0)).?);
 
     // Out of range
-    try std.testing.expectEqual(@as(?u4, null), floatToInt(u4, @as(f32, 16.0)));
-    try std.testing.expectEqual(@as(?i4, null), floatToInt(i4, -17.0));
-    try std.testing.expectEqual(@as(?u8, null), floatToInt(u8, -2.0));
+    try std.testing.expectEqual(@as(?u4, null), intFromFloat(u4, @as(f32, 16.0)));
+    try std.testing.expectEqual(@as(?i4, null), intFromFloat(i4, -17.0));
+    try std.testing.expectEqual(@as(?u8, null), intFromFloat(u8, -2.0));
 
     // Not a whole number
-    try std.testing.expectEqual(@as(?u8, null), floatToInt(u8, 0.5));
-    try std.testing.expectEqual(@as(?i8, null), floatToInt(i8, 0.01));
+    try std.testing.expectEqual(@as(?u8, null), intFromFloat(u8, 0.5));
+    try std.testing.expectEqual(@as(?i8, null), intFromFloat(i8, 0.01));
 
     // Infinity and NaN
-    try std.testing.expectEqual(@as(?u8, null), floatToInt(u8, std.math.inf(f32)));
-    try std.testing.expectEqual(@as(?u8, null), floatToInt(u8, -std.math.inf(f32)));
-    try std.testing.expectEqual(@as(?u8, null), floatToInt(u8, std.math.nan(f32)));
+    try std.testing.expectEqual(@as(?u8, null), intFromFloat(u8, std.math.inf(f32)));
+    try std.testing.expectEqual(@as(?u8, null), intFromFloat(u8, -std.math.inf(f32)));
+    try std.testing.expectEqual(@as(?u8, null), intFromFloat(u8, std.math.nan(f32)));
     try std.testing.expectEqual(
         @as(?comptime_int, null),
-        comptime floatToInt(comptime_int, std.math.inf(f32)),
+        comptime intFromFloat(comptime_int, std.math.inf(f32)),
     );
 }
 
