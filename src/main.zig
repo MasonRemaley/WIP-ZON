@@ -261,7 +261,7 @@ fn parseUnion(self: *Parser, comptime T: type, node: NodeIndex) Error!T {
 
         // Get the index of the named field. We don't use `parseEnum` here as
         // the order of the enum and the order of the union might not match!
-        const bytes = self.ast.tokenSlice(main_tokens[node]);
+        const bytes = self.parseIdentifier(main_tokens[node]);
         const field_index = field_indices.get(bytes) orelse
             return self.failUnknownField(T, node, bytes);
 
@@ -287,7 +287,7 @@ fn parseUnion(self: *Parser, comptime T: type, node: NodeIndex) Error!T {
 
         // Fill in the field we found
         const field_node = field_nodes[0];
-        const name = self.ast.tokenSlice(self.ast.firstToken(field_node) - 2);
+        const name = self.parseIdentifier(self.ast.firstToken(field_node) - 2);
         const i = field_indices.get(name) orelse
             return self.failUnknownField(T, field_node, name);
 
@@ -462,6 +462,15 @@ test "unions" {
             .line_end = 2,
         }, location);
     }
+
+    // Union field with @
+    {
+        const U = union(enum) { x: void };
+        const tag = try parseFromSlice(U, gpa, ".@\"x\"");
+        try std.testing.expectEqual(@as(U, .x), tag);
+        const initializer = try parseFromSlice(U, gpa, ".{.@\"x\" = {}}");
+        try std.testing.expectEqual(U{ .x = {} }, initializer);
+    }
 }
 
 // TODO: modify the parser instead of using this workaround? (is necessary because arrays of size
@@ -507,7 +516,7 @@ fn parseStruct(self: *Parser, comptime T: type, node: NodeIndex) Error!T {
     var field_found: [field_infos.len]bool = .{false} ** field_infos.len;
     for (field_nodes) |field_node| {
         // TODO: is this the correct way to get the field name? (used in a few places)
-        const name = self.ast.tokenSlice(self.ast.firstToken(field_node) - 2);
+        const name = self.parseIdentifier(self.ast.firstToken(field_node) - 2);
         const i = field_indices.get(name) orelse
             return self.failUnknownField(T, field_node, name);
 
@@ -648,6 +657,13 @@ test "structs" {
     {
         const Vec0 = struct { x: enum { x } };
         const parsed = try parseFromSlice(Vec0, gpa, ".{ .x = .x }");
+        try std.testing.expectEqual(Vec0{ .x = .x }, parsed);
+    }
+
+    // Enum field and struct field with @
+    {
+        const Vec0 = struct { x: enum { x } };
+        const parsed = try parseFromSlice(Vec0, gpa, ".{ .@\"x\" = .@\"x\" }");
         try std.testing.expectEqual(Vec0{ .x = .x }, parsed);
     }
 }
@@ -1347,10 +1363,18 @@ fn parseEnumTag(self: *Parser, comptime T: type, node: NodeIndex) error{Type}!T 
     const main_tokens = self.ast.nodes.items(.main_token);
     const data = self.ast.nodes.items(.data);
     const token = main_tokens[node];
-    const bytes = self.ast.tokenSlice(token);
+    var bytes = self.parseIdentifier(token);
     const dot_node = data[node].lhs;
     return tags.get(bytes) orelse
         self.failCannotRepresent(T, dot_node);
+}
+
+// TODO: is this built in anywhere?
+fn parseIdentifier(self: *const Parser, token: TokenIndex) []const u8 {
+    var bytes = self.ast.tokenSlice(token);
+    if (bytes[0] == '@' and bytes[1] == '"')
+        return bytes[2 .. bytes.len - 1];
+    return bytes;
 }
 
 test "enum literals" {
