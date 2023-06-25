@@ -287,7 +287,7 @@ fn parseUnion(self: *Parser, comptime T: type, node: NodeIndex) Error!T {
 
         // Fill in the field we found
         const field_node = field_nodes[0];
-        const name = self.ast.tokenSlice(main_tokens[field_node] - 2);
+        const name = self.ast.tokenSlice(self.ast.firstToken(field_node) - 2);
         const i = field_indices.get(name) orelse
             return self.failUnknownField(T, field_node, name);
 
@@ -347,8 +347,7 @@ test "unions" {
         try std.testing.expectEqualStrings(@typeName(Union), status.unknown_field.type_name);
         try std.testing.expectEqualStrings("z", status.unknown_field.field_name);
         const node = status.unknown_field.node;
-        const main_tokens = ast.nodes.items(.main_token);
-        const token = main_tokens[node] - 2;
+        const token = ast.firstToken(node) - 2;
         const location = ast.tokenLocation(0, token);
         try std.testing.expectEqual(Ast.Location{
             .line = 0,
@@ -487,53 +486,54 @@ fn elementsOrFields(
 fn parseStruct(self: *Parser, comptime T: type, node: NodeIndex) Error!T {
     // TODO: some of the array errors point to the brace instead of 0?
     const Struct = @typeInfo(T).Struct;
-    const main_tokens = self.ast.nodes.items(.main_token);
     const field_infos = Struct.fields;
 
     var result: T = undefined;
 
-    if (field_infos.len > 0) {
-        // Gather info on the fields
-        const field_indices = b: {
-            comptime var kvs_list: [field_infos.len]struct { []const u8, usize } = undefined;
-            inline for (field_infos, 0..) |field, i| {
-                kvs_list[i] = .{ field.name, i };
+    // Gather info on the fields
+    const field_indices = b: {
+        comptime var kvs_list: [field_infos.len]struct { []const u8, usize } = undefined;
+        inline for (field_infos, 0..) |field, i| {
+            kvs_list[i] = .{ field.name, i };
+        }
+        break :b std.ComptimeStringMap(usize, kvs_list);
+    };
+
+    // Parse the struct
+    var buf: [2]NodeIndex = undefined;
+    const field_nodes = try self.elementsOrFields(T, &buf, node);
+
+    // Fill in the fields we found
+    var field_found: [field_infos.len]bool = .{false} ** field_infos.len;
+    for (field_nodes) |field_node| {
+        // TODO: is this the correct way to get the field name? (used in a few places)
+        const name = self.ast.tokenSlice(self.ast.firstToken(field_node) - 2);
+        const i = field_indices.get(name) orelse
+            return self.failUnknownField(T, field_node, name);
+
+        // We now know the array is not zero sized (assert this so the code compiles)
+        if (field_found.len == 0) unreachable;
+
+        inline for (field_infos, 0..) |field_info, j| {
+            if (i == j) {
+                @field(result, field_info.name) = try self.parseExpr(field_info.type, field_node);
+                break;
             }
-            break :b std.ComptimeStringMap(usize, kvs_list);
-        };
-
-        // Parse the struct
-        var buf: [2]NodeIndex = undefined;
-        const field_nodes = try self.elementsOrFields(T, &buf, node);
-
-        // Fill in the fields we found
-        var field_found: [field_infos.len]bool = .{false} ** field_infos.len;
-        for (field_nodes) |field_node| {
-            const name = self.ast.tokenSlice(main_tokens[field_node] - 2);
-            const i = field_indices.get(name) orelse
-                return self.failUnknownField(T, field_node, name);
-
-            inline for (field_infos, 0..) |field_info, j| {
-                if (i == j) {
-                    @field(result, field_info.name) = try self.parseExpr(field_info.type, field_node);
-                    break;
-                }
-            }
-
-            field_found[i] = true;
         }
 
-        // Fill in any missing default fields
-        inline for (field_found, 0..) |found, i| {
-            if (!found) {
-                const field_info = Struct.fields[i];
-                if (field_info.default_value) |default| {
-                    const aligned = @alignCast(@alignOf(field_info.type), default);
-                    const typed = @ptrCast(*const field_info.type, aligned);
-                    @field(result, field_info.name) = typed.*;
-                } else {
-                    return self.failMissingField(T, field_infos[i].name, node);
-                }
+        field_found[i] = true;
+    }
+
+    // Fill in any missing default fields
+    inline for (field_found, 0..) |found, i| {
+        if (!found) {
+            const field_info = Struct.fields[i];
+            if (field_info.default_value) |default| {
+                const aligned = @alignCast(@alignOf(field_info.type), default);
+                const typed = @ptrCast(*const field_info.type, aligned);
+                @field(result, field_info.name) = typed.*;
+            } else {
+                return self.failMissingField(T, field_infos[i].name, node);
             }
         }
     }
@@ -584,12 +584,31 @@ test "structs" {
         try std.testing.expectEqualStrings(@typeName(Vec2), status.unknown_field.type_name);
         try std.testing.expectEqualStrings("z", status.unknown_field.field_name);
         const node = status.unknown_field.node;
-        const main_tokens = ast.nodes.items(.main_token);
-        const token = main_tokens[node] - 2;
+        const token = ast.firstToken(node) - 2;
         const location = ast.tokenLocation(0, token);
         try std.testing.expectEqual(Ast.Location{
             .line = 0,
             .column = 11,
+            .line_start = 0,
+            .line_end = 17,
+        }, location);
+    }
+
+    // Unknown field when struct has no fields (regression test)
+    {
+        const Vec2 = struct {};
+        var ast = try std.zig.Ast.parse(gpa, ".{.x=1.5, .z=2.5}", .zon);
+        defer ast.deinit(gpa);
+        var status: Status = .success;
+        try std.testing.expectError(error.Type, parseFromAst(Vec2, gpa, &ast, &status));
+        try std.testing.expectEqualStrings(@typeName(Vec2), status.unknown_field.type_name);
+        try std.testing.expectEqualStrings("x", status.unknown_field.field_name);
+        const node = status.unknown_field.node;
+        const token = ast.firstToken(node) - 2;
+        const location = ast.tokenLocation(0, token);
+        try std.testing.expectEqual(Ast.Location{
+            .line = 0,
+            .column = 3,
             .line_start = 0,
             .line_end = 17,
         }, location);
@@ -622,6 +641,14 @@ test "structs" {
         const Vec2 = struct { x: f32, y: f32 = 1.5 };
         const parsed = try parseFromSlice(Vec2, gpa, ".{.x = 1.2}");
         try std.testing.expectEqual(Vec2{ .x = 1.2, .y = 1.5 }, parsed);
+    }
+
+    // Enum field (regression test, we were previously getting the field name in an
+    // incorrect way that broke for enum values)
+    {
+        const Vec0 = struct { x: enum { x } };
+        const parsed = try parseFromSlice(Vec0, gpa, ".{ .x = .x }");
+        try std.testing.expectEqual(Vec0{ .x = .x }, parsed);
     }
 }
 
