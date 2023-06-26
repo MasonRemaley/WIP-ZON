@@ -43,6 +43,14 @@ pub const Status = union(enum) {
         type_name: []const u8,
         field_name: []const u8,
     },
+    unsupported_builtin: struct {
+        node: NodeIndex,
+        name: []const u8,
+    },
+    bad_arg_count: struct {
+        node: NodeIndex,
+        expected: u8,
+    },
 };
 
 pub fn parseFromAst(comptime T: type, gpa: Allocator, ast: *const Ast, err: ?*Status) Error!T {
@@ -1332,14 +1340,43 @@ fn parseEnumLiteral(self: *Parser, comptime T: type, node: NodeIndex) error{Type
     const tags = self.ast.nodes.items(.tag);
     return switch (tags[node]) {
         .enum_literal => try self.parseEnumTag(T, node),
-        .number_literal, .negation => try self.parseEnumNumber(T, node),
+        .builtin_call_two,
+        .builtin_call_two_comma,
+        .builtin_call,
+        .builtin_call_comma,
+        => try self.parseEnumFromInt(T, node),
         else => return self.failExpectedType(T, node),
     };
 }
 
-fn parseEnumNumber(self: *Parser, comptime T: type, node: NodeIndex) error{Type}!T {
+fn parseEnumFromInt(self: *Parser, comptime T: type, node: NodeIndex) error{Type}!T {
+    const main_tokens = self.ast.nodes.items(.main_token);
+    const token = main_tokens[node];
+    var bytes = self.ast.tokenSlice(token);
+    if (!std.mem.eql(u8, bytes, "@enumFromInt")) {
+        return self.failUnsupportedBuiltin(bytes, node);
+    }
+
+    const tags = self.ast.nodes.items(.tag);
+    const arg = switch (tags[node]) {
+        .builtin_call_two,
+        .builtin_call_two_comma,
+        .builtin_call,
+        .builtin_call_comma,
+        => b: {
+            const data = self.ast.nodes.items(.data);
+            const lhs = data[node].lhs;
+            const rhs = data[node].rhs;
+            if ((lhs == rhs) or (lhs != 0 and rhs != 0)) {
+                return self.failBadArgCount(node, 1);
+            }
+            break :b if (lhs == 0) rhs else lhs;
+        },
+        else => unreachable,
+    };
+
     // TODO: kinda weird dup error handling?
-    var number = self.parseNumber(@typeInfo(T).Enum.tag_type, node) catch
+    var number = self.parseNumber(@typeInfo(T).Enum.tag_type, arg) catch
         return self.failCannotRepresent(T, node);
     // TODO: should this be renamed too?
     return std.meta.intToEnum(T, number) catch
@@ -1429,12 +1466,17 @@ test "enum literals" {
     }
 }
 
-test "numeric enum literals" {
+test "@enumFromInt" {
     const gpa = std.testing.allocator;
 
     const Enum = enum(u8) {
         zero,
         three = 3,
+    };
+
+    const NonExhaustive = enum(u8) {
+        zero,
+        _,
     };
 
     const SignedEnum = enum(i8) {
@@ -1443,19 +1485,134 @@ test "numeric enum literals" {
     };
 
     // Test parsing numbers as enums
-    try std.testing.expectEqual(Enum.zero, try parseFromSlice(Enum, gpa, "0"));
-    try std.testing.expectEqual(Enum.three, try parseFromSlice(Enum, gpa, "3"));
-    try std.testing.expectEqual(SignedEnum.zero, try parseFromSlice(SignedEnum, gpa, "0"));
-    try std.testing.expectEqual(SignedEnum.three, try parseFromSlice(SignedEnum, gpa, "-3"));
+    try std.testing.expectEqual(@as(Enum, @enumFromInt(0)), try parseFromSlice(Enum, gpa, "@enumFromInt(0)"));
+    try std.testing.expectEqual(@as(Enum, @enumFromInt(3)), try parseFromSlice(Enum, gpa, "@enumFromInt(3)"));
+    try std.testing.expectEqual(@as(SignedEnum, @enumFromInt(0)), try parseFromSlice(SignedEnum, gpa, "@enumFromInt(0)"));
+    try std.testing.expectEqual(@as(SignedEnum, @enumFromInt(-3)), try parseFromSlice(SignedEnum, gpa, "@enumFromInt(-3)"));
+    try std.testing.expectEqual(@as(NonExhaustive, @enumFromInt(123)), try parseFromSlice(NonExhaustive, gpa, "@enumFromInt(123)"));
 
     // Bad tag
     {
-        var ast = try std.zig.Ast.parse(gpa, "2", .zon);
+        var ast = try std.zig.Ast.parse(gpa, "@enumFromInt(2)", .zon);
         defer ast.deinit(gpa);
         var status: Status = .success;
         try std.testing.expectError(error.Type, parseFromAst(Enum, gpa, &ast, &status));
         try std.testing.expectEqualSlices(u8, status.cannot_represent.name, @typeName(Enum));
         const node = status.cannot_represent.node;
+        const main_tokens = ast.nodes.items(.main_token);
+        const token = main_tokens[node];
+        const location = ast.tokenLocation(0, token);
+        try std.testing.expectEqual(Ast.Location{
+            .line = 0,
+            .column = 0,
+            .line_start = 0,
+            .line_end = 15,
+        }, location);
+    }
+
+    // Out of range tag
+    {
+        var ast = try std.zig.Ast.parse(gpa, "@enumFromInt(256)", .zon);
+        defer ast.deinit(gpa);
+        var status: Status = .success;
+        try std.testing.expectError(error.Type, parseFromAst(Enum, gpa, &ast, &status));
+        try std.testing.expectEqualSlices(u8, status.cannot_represent.name, @typeName(Enum));
+        const node = status.cannot_represent.node;
+        const main_tokens = ast.nodes.items(.main_token);
+        const token = main_tokens[node];
+        const location = ast.tokenLocation(0, token);
+        try std.testing.expectEqual(Ast.Location{
+            .line = 0,
+            .column = 0,
+            .line_start = 0,
+            .line_end = 17,
+        }, location);
+    }
+
+    // Unexpected negative tag
+    {
+        var ast = try std.zig.Ast.parse(gpa, "@enumFromInt(-3)", .zon);
+        defer ast.deinit(gpa);
+        var status: Status = .success;
+        try std.testing.expectError(error.Type, parseFromAst(Enum, gpa, &ast, &status));
+        try std.testing.expectEqualSlices(u8, status.cannot_represent.name, @typeName(Enum));
+        const node = status.cannot_represent.node;
+        const main_tokens = ast.nodes.items(.main_token);
+        const token = main_tokens[node];
+        const location = ast.tokenLocation(0, token);
+        try std.testing.expectEqual(Ast.Location{
+            .line = 0,
+            .column = 0,
+            .line_start = 0,
+            .line_end = 16,
+        }, location);
+    }
+
+    // Float tag
+    {
+        var ast = try std.zig.Ast.parse(gpa, "@enumFromInt(1.5)", .zon);
+        defer ast.deinit(gpa);
+        var status: Status = .success;
+        try std.testing.expectError(error.Type, parseFromAst(Enum, gpa, &ast, &status));
+        try std.testing.expectEqualSlices(u8, status.cannot_represent.name, @typeName(Enum));
+        const node = status.cannot_represent.node;
+        const main_tokens = ast.nodes.items(.main_token);
+        const token = main_tokens[node];
+        const location = ast.tokenLocation(0, token);
+        try std.testing.expectEqual(Ast.Location{
+            .line = 0,
+            .column = 0,
+            .line_start = 0,
+            .line_end = 17,
+        }, location);
+    }
+
+    // Wrong builtin
+    {
+        var ast = try std.zig.Ast.parse(gpa, "@fooBarBaz(1)", .zon);
+        defer ast.deinit(gpa);
+        var status: Status = .success;
+        try std.testing.expectError(error.Type, parseFromAst(Enum, gpa, &ast, &status));
+        try std.testing.expectEqualSlices(u8, status.unsupported_builtin.name, "@fooBarBaz");
+        const node = status.unsupported_builtin.node;
+        const main_tokens = ast.nodes.items(.main_token);
+        const token = main_tokens[node];
+        const location = ast.tokenLocation(0, token);
+        try std.testing.expectEqual(Ast.Location{
+            .line = 0,
+            .column = 0,
+            .line_start = 0,
+            .line_end = 13,
+        }, location);
+    }
+
+    // Bad arg count
+    {
+        var ast = try std.zig.Ast.parse(gpa, "@enumFromInt(1, 2)", .zon);
+        defer ast.deinit(gpa);
+        var status: Status = .success;
+        try std.testing.expectError(error.Type, parseFromAst(Enum, gpa, &ast, &status));
+        try std.testing.expectEqual(status.bad_arg_count.expected, 1);
+        const node = status.bad_arg_count.node;
+        const main_tokens = ast.nodes.items(.main_token);
+        const token = main_tokens[node];
+        const location = ast.tokenLocation(0, token);
+        try std.testing.expectEqual(Ast.Location{
+            .line = 0,
+            .column = 0,
+            .line_start = 0,
+            .line_end = 18,
+        }, location);
+    }
+
+    // Bad coercion
+    {
+        var ast = try std.zig.Ast.parse(gpa, "1", .zon);
+        defer ast.deinit(gpa);
+        var status: Status = .success;
+        try std.testing.expectError(error.Type, parseFromAst(Enum, gpa, &ast, &status));
+        try std.testing.expectEqualStrings(@typeName(Enum), status.expected_type.name);
+        const node = status.expected_type.node;
         const main_tokens = ast.nodes.items(.main_token);
         const token = main_tokens[node];
         const location = ast.tokenLocation(0, token);
@@ -1464,63 +1621,6 @@ test "numeric enum literals" {
             .column = 0,
             .line_start = 0,
             .line_end = 1,
-        }, location);
-    }
-
-    // Out of range tag
-    {
-        var ast = try std.zig.Ast.parse(gpa, "256", .zon);
-        defer ast.deinit(gpa);
-        var status: Status = .success;
-        try std.testing.expectError(error.Type, parseFromAst(Enum, gpa, &ast, &status));
-        try std.testing.expectEqualSlices(u8, status.cannot_represent.name, @typeName(Enum));
-        const node = status.cannot_represent.node;
-        const main_tokens = ast.nodes.items(.main_token);
-        const token = main_tokens[node];
-        const location = ast.tokenLocation(0, token);
-        try std.testing.expectEqual(Ast.Location{
-            .line = 0,
-            .column = 0,
-            .line_start = 0,
-            .line_end = 3,
-        }, location);
-    }
-
-    // Unexpected negative tag
-    {
-        var ast = try std.zig.Ast.parse(gpa, "-3", .zon);
-        defer ast.deinit(gpa);
-        var status: Status = .success;
-        try std.testing.expectError(error.Type, parseFromAst(Enum, gpa, &ast, &status));
-        try std.testing.expectEqualSlices(u8, status.cannot_represent.name, @typeName(Enum));
-        const node = status.cannot_represent.node;
-        const main_tokens = ast.nodes.items(.main_token);
-        const token = main_tokens[node];
-        const location = ast.tokenLocation(0, token);
-        try std.testing.expectEqual(Ast.Location{
-            .line = 0,
-            .column = 0,
-            .line_start = 0,
-            .line_end = 2,
-        }, location);
-    }
-
-    // Float tag
-    {
-        var ast = try std.zig.Ast.parse(gpa, "1.5", .zon);
-        defer ast.deinit(gpa);
-        var status: Status = .success;
-        try std.testing.expectError(error.Type, parseFromAst(Enum, gpa, &ast, &status));
-        try std.testing.expectEqualSlices(u8, status.cannot_represent.name, @typeName(Enum));
-        const node = status.cannot_represent.node;
-        const main_tokens = ast.nodes.items(.main_token);
-        const token = main_tokens[node];
-        const location = ast.tokenLocation(0, token);
-        try std.testing.expectEqual(Ast.Location{
-            .line = 0,
-            .column = 0,
-            .line_start = 0,
-            .line_end = 3,
         }, location);
     }
 }
@@ -1579,6 +1679,22 @@ fn failMissingField(self: *Parser, comptime T: type, name: []const u8, node: Nod
         .node = node,
         .type_name = @typeName(T),
         .field_name = name,
+    } });
+}
+
+fn failUnsupportedBuiltin(self: *Parser, name: []const u8, node: NodeIndex) error{Type} {
+    @setCold(true);
+    return self.fail(.{ .unsupported_builtin = .{
+        .node = node,
+        .name = name,
+    } });
+}
+
+fn failBadArgCount(self: *Parser, node: NodeIndex, expected: u8) error{Type} {
+    @setCold(true);
+    return self.fail(.{ .bad_arg_count = .{
+        .node = node,
+        .expected = expected,
     } });
 }
 
@@ -1695,7 +1811,6 @@ fn applySignToInt(self: *Parser, comptime T: type, node: NodeIndex, int: anytype
                         return self.failCannotRepresent(T, node);
                     }
                     const positive: Positive = @intCast(int);
-                    // XXX: is the sign inside of the cast correct?
                     return @as(T, @intCast(-positive));
                 },
                 .unsigned => return self.failCannotRepresent(T, node),
