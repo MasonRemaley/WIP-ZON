@@ -94,7 +94,7 @@ pub fn parseFree(gpa: Allocator, value: anytype) void {
         .Union => |Union| {
             const Tag = Union.tag_type orelse failFreeType(Value);
             inline for (@typeInfo(Tag).Enum.fields, 0..) |field, i| {
-                const tag = @enumFromInt(Tag, i);
+                const tag: Tag = @enumFromInt(i);
                 if (value == tag) {
                     parseFree(gpa, @field(value, field.name));
                     break;
@@ -538,8 +538,7 @@ fn parseStruct(self: *Parser, comptime T: type, node: NodeIndex) Error!T {
         if (!found) {
             const field_info = Struct.fields[i];
             if (field_info.default_value) |default| {
-                const aligned = @alignCast(@alignOf(field_info.type), default);
-                const typed = @ptrCast(*const field_info.type, aligned);
+                const typed: *const field_info.type = @ptrCast(@alignCast(default));
                 @field(result, field_info.name) = typed.*;
             } else {
                 return self.failMissingField(T, field_infos[i].name, node);
@@ -1106,7 +1105,7 @@ fn parseAddressOf(self: *Parser, comptime T: type, node: NodeIndex) Error!T {
     const element_nodes = try self.elementsOrFields(T, &buf, node);
 
     // Allocate the slice
-    const sentinel = if (Ptr.sentinel) |s| @ptrCast(*const Ptr.child, s).* else null;
+    const sentinel = if (Ptr.sentinel) |s| @as(*const Ptr.child, @ptrCast(s)).* else null;
     var slice = try self.gpa.allocWithOptions(
         Ptr.child,
         element_nodes.len,
@@ -1144,7 +1143,7 @@ fn parseStringLiteral(self: *Parser, comptime T: type, node: NodeIndex) !T {
             }
 
             if (Pointer.sentinel) |sentinel| {
-                if (@ptrCast(*const u8, sentinel).* != 0) {
+                if (@as(*const u8, @ptrCast(sentinel)).* != 0) {
                     return self.failExpectedType(T, node);
                 }
 
@@ -1165,7 +1164,7 @@ fn parseStringLiteral(self: *Parser, comptime T: type, node: NodeIndex) !T {
         },
         .Array => |Array| {
             if (Array.sentinel) |sentinel| {
-                if (@ptrCast(*const u8, sentinel).* != 0) {
+                if (@as(*const u8, @ptrCast(sentinel)).* != 0) {
                     return self.failExpectedType(T, node);
                 }
             }
@@ -1352,7 +1351,7 @@ fn parseEnumTag(self: *Parser, comptime T: type, node: NodeIndex) error{Type}!T 
     const enum_fields = @typeInfo(T).Enum.fields;
     comptime var kvs_list: [enum_fields.len]struct { []const u8, T } = undefined;
     inline for (enum_fields, 0..) |field, i| {
-        kvs_list[i] = .{ field.name, @enumFromInt(T, field.value) };
+        kvs_list[i] = .{ field.name, @enumFromInt(field.value) };
     }
     const tags = std.ComptimeStringMap(T, kvs_list);
 
@@ -1695,19 +1694,20 @@ fn applySignToInt(self: *Parser, comptime T: type, node: NodeIndex, int: anytype
                     if (int > std.math.maxInt(T) + 1) {
                         return self.failCannotRepresent(T, node);
                     }
-                    const positive = @intCast(Positive, int);
-                    return @intCast(T, -positive);
+                    const positive: Positive = @intCast(int);
+                    // XXX: is the sign inside of the cast correct?
+                    return @as(T, @intCast(-positive));
                 },
                 .unsigned => return self.failCannotRepresent(T, node),
             },
-            .Float => return -@floatFromInt(T, int),
+            .Float => return -@as(T, @floatFromInt(int)),
             else => @compileError("expected numeric type"),
         }
     } else {
         switch (@typeInfo(T)) {
             .Int => return std.math.cast(T, int) orelse
                 self.failCannotRepresent(T, node),
-            .Float => return @floatFromInt(T, int),
+            .Float => return @as(T, @floatFromInt(int)),
             else => @compileError("expected numeric type"),
         }
     }
@@ -1722,7 +1722,7 @@ fn parseBigNumber(
     switch (@typeInfo(T)) {
         .Int => return self.parseBigInt(T, node, base),
         // TODO: passing in f128 to work around possible float parsing bug
-        .Float => return @floatCast(T, try self.parseFloat(f128, node)),
+        .Float => return @as(T, @floatCast(try self.parseFloat(f128, node))),
         else => unreachable,
     }
 }
@@ -1738,13 +1738,13 @@ fn parseBigInt(self: *Parser, comptime T: type, node: NodeIndex, base: Base) err
     for (bytes[prefix_offset..]) |char| {
         if (char == '_') continue;
         const d = std.fmt.charToDigit(char, @intFromEnum(base)) catch unreachable;
-        result = std.math.mul(T, result, @intCast(T, @intFromEnum(base))) catch
+        result = std.math.mul(T, result, @as(T, @intCast(@intFromEnum(base)))) catch
             return self.failCannotRepresent(T, node);
         if (self.isNegative(node)) {
-            result = std.math.sub(T, result, @intCast(T, d)) catch
+            result = std.math.sub(T, result, @as(T, @intCast(d))) catch
                 return self.failCannotRepresent(T, node);
         } else {
-            result = std.math.add(T, result, @intCast(T, d)) catch
+            result = std.math.add(T, result, @as(T, @intCast(d))) catch
                 return self.failCannotRepresent(T, node);
         }
     }
@@ -1819,7 +1819,7 @@ fn intFromFloat(comptime T: type, value: anytype) ?T {
         return null;
     }
 
-    return @intFromFloat(T, value);
+    return @as(T, @intFromFloat(value));
 }
 
 test "intFromFloat" {
