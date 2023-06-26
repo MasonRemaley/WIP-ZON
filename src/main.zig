@@ -14,6 +14,12 @@ const Parser = @This();
 gpa: Allocator,
 ast: *const Ast,
 status: ?*Status,
+options: ParseOptions,
+
+pub const ParseOptions = struct {
+    ignore_unknown_fields: bool = false,
+    // TODO: support max_value_len too?
+};
 
 pub const Error = error{ OutOfMemory, Type };
 
@@ -53,11 +59,12 @@ pub const Status = union(enum) {
     },
 };
 
-pub fn parseFromAst(comptime T: type, gpa: Allocator, ast: *const Ast, err: ?*Status) Error!T {
+pub fn parseFromAst(comptime T: type, gpa: Allocator, ast: *const Ast, err: ?*Status, options: ParseOptions) Error!T {
     var parser = Parser{
         .gpa = gpa,
         .ast = ast,
         .status = err,
+        .options = options,
     };
     const data = ast.nodes.items(.data);
     // TODO: why lhs here?
@@ -72,11 +79,11 @@ test "error literals" {
     // try std.testing.expectEqual(error.Foo, parsed);
 }
 
-pub fn parseFromSlice(comptime T: type, gpa: Allocator, source: [:0]const u8) Error!T {
+pub fn parseFromSlice(comptime T: type, gpa: Allocator, source: [:0]const u8, options: ParseOptions) Error!T {
     var ast = try std.zig.Ast.parse(gpa, source, .zon);
     defer ast.deinit(gpa);
     assert(ast.errors.len == 0);
-    return parseFromAst(T, gpa, &ast, null);
+    return parseFromAst(T, gpa, &ast, null, options);
 }
 
 pub fn parseFree(gpa: Allocator, value: anytype) void {
@@ -157,11 +164,11 @@ fn parseVoid(self: *Parser, node: NodeIndex) Error!void {
 test "void" {
     const gpa = std.testing.allocator;
 
-    const parsed: void = try parseFromSlice(void, gpa, "{}");
+    const parsed: void = try parseFromSlice(void, gpa, "{}", .{});
     _ = parsed;
 
     // Freeing void is a noop, but it should compile!
-    const free: void = try parseFromSlice(void, gpa, "{}");
+    const free: void = try parseFromSlice(void, gpa, "{}", .{});
     defer parseFree(gpa, free);
 
     // Other type
@@ -169,7 +176,7 @@ test "void" {
         var ast = try std.zig.Ast.parse(gpa, "123", .zon);
         defer ast.deinit(gpa);
         var status: Status = .success;
-        try std.testing.expectError(error.Type, parseFromAst(void, gpa, &ast, &status));
+        try std.testing.expectError(error.Type, parseFromAst(void, gpa, &ast, &status, .{}));
         try std.testing.expectEqualStrings(@typeName(void), status.expected_type.name);
         const node = status.expected_type.node;
         const main_tokens = ast.nodes.items(.main_token);
@@ -188,7 +195,7 @@ test "void" {
         var ast = try std.zig.Ast.parse(gpa, "{1}", .zon);
         defer ast.deinit(gpa);
         var status: Status = .success;
-        try std.testing.expectError(error.Type, parseFromAst(void, gpa, &ast, &status));
+        try std.testing.expectError(error.Type, parseFromAst(void, gpa, &ast, &status, .{}));
         try std.testing.expectEqualStrings(@typeName(void), status.expected_type.name);
         const node = status.expected_type.node;
         const main_tokens = ast.nodes.items(.main_token);
@@ -224,17 +231,17 @@ test "optional" {
 
     // Basic usage
     {
-        const none = try parseFromSlice(?u32, gpa, "null");
+        const none = try parseFromSlice(?u32, gpa, "null", .{});
         try std.testing.expect(none == null);
-        const some = try parseFromSlice(?u32, gpa, "1");
+        const some = try parseFromSlice(?u32, gpa, "1", .{});
         try std.testing.expect(some.? == 1);
     }
 
     // Deep free
     {
-        const none = try parseFromSlice(?[]const u8, gpa, "null");
+        const none = try parseFromSlice(?[]const u8, gpa, "null", .{});
         try std.testing.expect(none == null);
-        const some = try parseFromSlice(?[]const u8, gpa, "\"foo\"");
+        const some = try parseFromSlice(?[]const u8, gpa, "\"foo\"", .{});
         defer parseFree(gpa, some);
         try std.testing.expectEqualStrings("foo", some.?);
     }
@@ -318,18 +325,18 @@ test "unions" {
         const Tagged = union(enum) { x: f32, y: bool, z };
         const Untagged = union { x: f32, y: bool, z: void };
 
-        const tagged_x = try parseFromSlice(Tagged, gpa, ".{.x = 1.5}");
+        const tagged_x = try parseFromSlice(Tagged, gpa, ".{.x = 1.5}", .{});
         try std.testing.expectEqual(Tagged{ .x = 1.5 }, tagged_x);
-        const tagged_y = try parseFromSlice(Tagged, gpa, ".{.y = true}");
+        const tagged_y = try parseFromSlice(Tagged, gpa, ".{.y = true}", .{});
         try std.testing.expectEqual(Tagged{ .y = true }, tagged_y);
-        const tagged_z_shorthand = try parseFromSlice(Tagged, gpa, ".z");
+        const tagged_z_shorthand = try parseFromSlice(Tagged, gpa, ".z", .{});
         try std.testing.expectEqual(@as(Tagged, .z), tagged_z_shorthand);
-        const tagged_z_explicit = try parseFromSlice(Tagged, gpa, ".{.z = {}}");
+        const tagged_z_explicit = try parseFromSlice(Tagged, gpa, ".{.z = {}}", .{});
         try std.testing.expectEqual(Tagged{ .z = {} }, tagged_z_explicit);
 
-        const untagged_x = try parseFromSlice(Untagged, gpa, ".{.x = 1.5}");
+        const untagged_x = try parseFromSlice(Untagged, gpa, ".{.x = 1.5}", .{});
         try std.testing.expect(untagged_x.x == 1.5);
-        const untagged_y = try parseFromSlice(Untagged, gpa, ".{.y = true}");
+        const untagged_y = try parseFromSlice(Untagged, gpa, ".{.y = true}", .{});
         try std.testing.expect(untagged_y.y);
     }
 
@@ -337,10 +344,10 @@ test "unions" {
     {
         const Union = union(enum) { bar: []const u8, baz: bool };
 
-        const noalloc = try parseFromSlice(Union, gpa, ".{.baz = false}");
+        const noalloc = try parseFromSlice(Union, gpa, ".{.baz = false}", .{});
         try std.testing.expectEqual(Union{ .baz = false }, noalloc);
 
-        const alloc = try parseFromSlice(Union, gpa, ".{.bar = \"qux\"}");
+        const alloc = try parseFromSlice(Union, gpa, ".{.bar = \"qux\"}", .{});
         defer parseFree(gpa, alloc);
         try std.testing.expectEqualDeep(Union{ .bar = "qux" }, alloc);
     }
@@ -351,7 +358,7 @@ test "unions" {
         var ast = try std.zig.Ast.parse(gpa, ".{.z=2.5}", .zon);
         defer ast.deinit(gpa);
         var status: Status = .success;
-        try std.testing.expectError(error.Type, parseFromAst(Union, gpa, &ast, &status));
+        try std.testing.expectError(error.Type, parseFromAst(Union, gpa, &ast, &status, .{}));
         try std.testing.expectEqualStrings(@typeName(Union), status.unknown_field.type_name);
         try std.testing.expectEqualStrings("z", status.unknown_field.field_name);
         const node = status.unknown_field.node;
@@ -371,7 +378,7 @@ test "unions" {
         var ast = try std.zig.Ast.parse(gpa, ".{.x = 1.5, .y = true}", .zon);
         defer ast.deinit(gpa);
         var status: Status = .success;
-        try std.testing.expectError(error.Type, parseFromAst(Union, gpa, &ast, &status));
+        try std.testing.expectError(error.Type, parseFromAst(Union, gpa, &ast, &status, .{}));
         try std.testing.expectEqualStrings(@typeName(Union), status.expected_type.name);
         const node = status.expected_type.node;
         const main_tokens = ast.nodes.items(.main_token);
@@ -392,7 +399,7 @@ test "unions" {
         var ast = try std.zig.Ast.parse(gpa, ".{}", .zon);
         defer ast.deinit(gpa);
         var status: Status = .success;
-        try std.testing.expectError(error.Type, parseFromAst(Union, gpa, &ast, &status));
+        try std.testing.expectError(error.Type, parseFromAst(Union, gpa, &ast, &status, .{}));
         try std.testing.expectEqualStrings(@typeName(Union), status.expected_type.name);
         const node = status.expected_type.node;
         const main_tokens = ast.nodes.items(.main_token);
@@ -413,7 +420,7 @@ test "unions" {
         var ast = try std.zig.Ast.parse(gpa, ".x", .zon);
         defer ast.deinit(gpa);
         var status: Status = .success;
-        try std.testing.expectError(error.Type, parseFromAst(Union, gpa, &ast, &status));
+        try std.testing.expectError(error.Type, parseFromAst(Union, gpa, &ast, &status, .{}));
         try std.testing.expectEqualStrings(@typeName(Union), status.expected_type.name);
         const node = status.expected_type.node;
         const main_tokens = ast.nodes.items(.main_token);
@@ -434,7 +441,7 @@ test "unions" {
         var ast = try std.zig.Ast.parse(gpa, ".y", .zon);
         defer ast.deinit(gpa);
         var status: Status = .success;
-        try std.testing.expectError(error.Type, parseFromAst(Union, gpa, &ast, &status));
+        try std.testing.expectError(error.Type, parseFromAst(Union, gpa, &ast, &status, .{}));
         try std.testing.expectEqualStrings(@typeName(Union), status.unknown_field.type_name);
         try std.testing.expectEqualStrings("y", status.unknown_field.field_name);
         const node = status.unknown_field.node;
@@ -456,7 +463,7 @@ test "unions" {
         var ast = try std.zig.Ast.parse(gpa, ".x", .zon);
         defer ast.deinit(gpa);
         var status: Status = .success;
-        try std.testing.expectError(error.Type, parseFromAst(Union, gpa, &ast, &status));
+        try std.testing.expectError(error.Type, parseFromAst(Union, gpa, &ast, &status, .{}));
         try std.testing.expectEqualStrings(@typeName(Union), status.expected_type.name);
         const node = status.expected_type.node;
         const main_tokens = ast.nodes.items(.main_token);
@@ -474,9 +481,9 @@ test "unions" {
     // Union field with @
     {
         const U = union(enum) { x: void };
-        const tag = try parseFromSlice(U, gpa, ".@\"x\"");
+        const tag = try parseFromSlice(U, gpa, ".@\"x\"", .{});
         try std.testing.expectEqual(@as(U, .x), tag);
-        const initializer = try parseFromSlice(U, gpa, ".{.@\"x\" = {}}");
+        const initializer = try parseFromSlice(U, gpa, ".{.@\"x\" = {}}", .{});
         try std.testing.expectEqual(U{ .x = {} }, initializer);
     }
 }
@@ -525,8 +532,11 @@ fn parseStruct(self: *Parser, comptime T: type, node: NodeIndex) Error!T {
     for (field_nodes) |field_node| {
         // TODO: is this the correct way to get the field name? (used in a few places)
         const name = self.parseIdentifier(self.ast.firstToken(field_node) - 2);
-        const i = field_indices.get(name) orelse
+        const i = field_indices.get(name) orelse if (self.options.ignore_unknown_fields) {
+            continue;
+        } else {
             return self.failUnknownField(T, field_node, name);
+        };
 
         // We now know the array is not zero sized (assert this so the code compiles)
         if (field_found.len == 0) unreachable;
@@ -568,16 +578,16 @@ test "structs" {
         const Vec2 = struct { x: f32, y: f32 };
         const Vec3 = struct { x: f32, y: f32, z: f32 };
 
-        const zero = try parseFromSlice(Vec0, gpa, ".{}");
+        const zero = try parseFromSlice(Vec0, gpa, ".{}", .{});
         try std.testing.expectEqual(Vec0{}, zero);
 
-        const one = try parseFromSlice(Vec1, gpa, ".{.x = 1.2}");
+        const one = try parseFromSlice(Vec1, gpa, ".{.x = 1.2}", .{});
         try std.testing.expectEqual(Vec1{ .x = 1.2 }, one);
 
-        const two = try parseFromSlice(Vec2, gpa, ".{.x = 1.2, .y = 3.4}");
+        const two = try parseFromSlice(Vec2, gpa, ".{.x = 1.2, .y = 3.4}", .{});
         try std.testing.expectEqual(Vec2{ .x = 1.2, .y = 3.4 }, two);
 
-        const three = try parseFromSlice(Vec3, gpa, ".{.x = 1.2, .y = 3.4, .z = 5.6}");
+        const three = try parseFromSlice(Vec3, gpa, ".{.x = 1.2, .y = 3.4, .z = 5.6}", .{});
         try std.testing.expectEqual(Vec3{ .x = 1.2, .y = 3.4, .z = 5.6 }, three);
     }
 
@@ -585,7 +595,7 @@ test "structs" {
     {
         const Foo = struct { bar: []const u8, baz: []const []const u8 };
 
-        const parsed = try parseFromSlice(Foo, gpa, ".{.bar = \"qux\", .baz = &.{\"a\", \"b\"}}");
+        const parsed = try parseFromSlice(Foo, gpa, ".{.bar = \"qux\", .baz = &.{\"a\", \"b\"}}", .{});
         defer parseFree(gpa, parsed);
         try std.testing.expectEqualDeep(Foo{ .bar = "qux", .baz = &.{ "a", "b" } }, parsed);
     }
@@ -596,7 +606,7 @@ test "structs" {
         var ast = try std.zig.Ast.parse(gpa, ".{.x=1.5, .z=2.5}", .zon);
         defer ast.deinit(gpa);
         var status: Status = .success;
-        try std.testing.expectError(error.Type, parseFromAst(Vec2, gpa, &ast, &status));
+        try std.testing.expectError(error.Type, parseFromAst(Vec2, gpa, &ast, &status, .{}));
         try std.testing.expectEqualStrings(@typeName(Vec2), status.unknown_field.type_name);
         try std.testing.expectEqualStrings("z", status.unknown_field.field_name);
         const node = status.unknown_field.node;
@@ -610,13 +620,20 @@ test "structs" {
         }, location);
     }
 
+    // Ignore unknown fields
+    {
+        const Vec2 = struct { x: f32, y: f32 = 2.0 };
+        const parsed = try parseFromSlice(Vec2, gpa, ".{ .x = 1.0, .z = 3.0 }", .{ .ignore_unknown_fields = true });
+        try std.testing.expectEqual(Vec2{ .x = 1.0, .y = 2.0 }, parsed);
+    }
+
     // Unknown field when struct has no fields (regression test)
     {
         const Vec2 = struct {};
         var ast = try std.zig.Ast.parse(gpa, ".{.x=1.5, .z=2.5}", .zon);
         defer ast.deinit(gpa);
         var status: Status = .success;
-        try std.testing.expectError(error.Type, parseFromAst(Vec2, gpa, &ast, &status));
+        try std.testing.expectError(error.Type, parseFromAst(Vec2, gpa, &ast, &status, .{}));
         try std.testing.expectEqualStrings(@typeName(Vec2), status.unknown_field.type_name);
         try std.testing.expectEqualStrings("x", status.unknown_field.field_name);
         const node = status.unknown_field.node;
@@ -636,7 +653,7 @@ test "structs" {
         var ast = try std.zig.Ast.parse(gpa, ".{.x=1.5}", .zon);
         defer ast.deinit(gpa);
         var status: Status = .success;
-        try std.testing.expectError(error.Type, parseFromAst(Vec2, gpa, &ast, &status));
+        try std.testing.expectError(error.Type, parseFromAst(Vec2, gpa, &ast, &status, .{}));
         try std.testing.expectEqualStrings(@typeName(Vec2), status.missing_field.type_name);
         try std.testing.expectEqualStrings("y", status.missing_field.field_name);
         const node = status.missing_field.node;
@@ -655,7 +672,7 @@ test "structs" {
     // Default field
     {
         const Vec2 = struct { x: f32, y: f32 = 1.5 };
-        const parsed = try parseFromSlice(Vec2, gpa, ".{.x = 1.2}");
+        const parsed = try parseFromSlice(Vec2, gpa, ".{.x = 1.2}", .{});
         try std.testing.expectEqual(Vec2{ .x = 1.2, .y = 1.5 }, parsed);
     }
 
@@ -663,14 +680,14 @@ test "structs" {
     // incorrect way that broke for enum values)
     {
         const Vec0 = struct { x: enum { x } };
-        const parsed = try parseFromSlice(Vec0, gpa, ".{ .x = .x }");
+        const parsed = try parseFromSlice(Vec0, gpa, ".{ .x = .x }", .{});
         try std.testing.expectEqual(Vec0{ .x = .x }, parsed);
     }
 
     // Enum field and struct field with @
     {
         const Vec0 = struct { x: enum { x } };
-        const parsed = try parseFromSlice(Vec0, gpa, ".{ .@\"x\" = .@\"x\" }");
+        const parsed = try parseFromSlice(Vec0, gpa, ".{ .@\"x\" = .@\"x\" }", .{});
         try std.testing.expectEqual(Vec0{ .x = .x }, parsed);
     }
 }
@@ -707,23 +724,23 @@ test "tuples" {
         const Tuple2 = struct { f32, bool };
         const Tuple3 = struct { f32, bool, u8 };
 
-        const zero = try parseFromSlice(Tuple0, gpa, ".{}");
+        const zero = try parseFromSlice(Tuple0, gpa, ".{}", .{});
         try std.testing.expectEqual(Tuple0{}, zero);
 
-        const one = try parseFromSlice(Tuple1, gpa, ".{1.2}");
+        const one = try parseFromSlice(Tuple1, gpa, ".{1.2}", .{});
         try std.testing.expectEqual(Tuple1{1.2}, one);
 
-        const two = try parseFromSlice(Tuple2, gpa, ".{1.2, true}");
+        const two = try parseFromSlice(Tuple2, gpa, ".{1.2, true}", .{});
         try std.testing.expectEqual(Tuple2{ 1.2, true }, two);
 
-        const three = try parseFromSlice(Tuple3, gpa, ".{1.2, false, 3}");
+        const three = try parseFromSlice(Tuple3, gpa, ".{1.2, false, 3}", .{});
         try std.testing.expectEqual(Tuple3{ 1.2, false, 3 }, three);
     }
 
     // Deep free
     {
         const Tuple = struct { []const u8, []const u8 };
-        const parsed = try parseFromSlice(Tuple, gpa, ".{\"hello\", \"world\"}");
+        const parsed = try parseFromSlice(Tuple, gpa, ".{\"hello\", \"world\"}", .{});
         defer parseFree(gpa, parsed);
         try std.testing.expectEqualDeep(Tuple{ "hello", "world" }, parsed);
     }
@@ -734,7 +751,7 @@ test "tuples" {
         var ast = try std.zig.Ast.parse(gpa, ".{0.5, true, 123}", .zon);
         defer ast.deinit(gpa);
         var status: Status = .success;
-        try std.testing.expectError(error.Type, parseFromAst(Tuple, gpa, &ast, &status));
+        try std.testing.expectError(error.Type, parseFromAst(Tuple, gpa, &ast, &status, .{}));
         try std.testing.expectEqualStrings(@typeName(Tuple), status.expected_type.name);
         const node = status.expected_type.node;
         const main_tokens = ast.nodes.items(.main_token);
@@ -755,7 +772,7 @@ test "tuples" {
         var ast = try std.zig.Ast.parse(gpa, ".{0.5}", .zon);
         defer ast.deinit(gpa);
         var status: Status = .success;
-        try std.testing.expectError(error.Type, parseFromAst(Tuple, gpa, &ast, &status));
+        try std.testing.expectError(error.Type, parseFromAst(Tuple, gpa, &ast, &status, .{}));
         try std.testing.expectEqualStrings(@typeName(Tuple), status.expected_type.name);
         const node = status.expected_type.node;
         const main_tokens = ast.nodes.items(.main_token);
@@ -800,49 +817,49 @@ test "arrays and slices" {
     {
         // Arrays
         {
-            const zero = try parseFromSlice([0]u8, gpa, ".{}");
+            const zero = try parseFromSlice([0]u8, gpa, ".{}", .{});
             try std.testing.expectEqualSlices(u8, &@as([0]u8, .{}), &zero);
 
-            const one = try parseFromSlice([1]u8, gpa, ".{'a'}");
+            const one = try parseFromSlice([1]u8, gpa, ".{'a'}", .{});
             try std.testing.expectEqualSlices(u8, &@as([1]u8, .{'a'}), &one);
 
-            const two = try parseFromSlice([2]u8, gpa, ".{'a', 'b'}");
+            const two = try parseFromSlice([2]u8, gpa, ".{'a', 'b'}", .{});
             try std.testing.expectEqualSlices(u8, &@as([2]u8, .{ 'a', 'b' }), &two);
 
-            const two_comma = try parseFromSlice([2]u8, gpa, ".{'a', 'b',}");
+            const two_comma = try parseFromSlice([2]u8, gpa, ".{'a', 'b',}", .{});
             try std.testing.expectEqualSlices(u8, &@as([2]u8, .{ 'a', 'b' }), &two_comma);
 
-            const three = try parseFromSlice([3]u8, gpa, ".{'a', 'b', 'c'}");
+            const three = try parseFromSlice([3]u8, gpa, ".{'a', 'b', 'c'}", .{});
             try std.testing.expectEqualSlices(u8, &.{ 'a', 'b', 'c' }, &three);
 
-            const sentinel = try parseFromSlice([3:'z']u8, gpa, ".{'a', 'b', 'c'}");
+            const sentinel = try parseFromSlice([3:'z']u8, gpa, ".{'a', 'b', 'c'}", .{});
             const expected_sentinel: [3:'z']u8 = .{ 'a', 'b', 'c' };
             try std.testing.expectEqualSlices(u8, &expected_sentinel, &sentinel);
         }
 
         // Slice literals
         {
-            const zero = try parseFromSlice([]const u8, gpa, "&.{}");
+            const zero = try parseFromSlice([]const u8, gpa, "&.{}", .{});
             defer parseFree(gpa, zero);
             try std.testing.expectEqualSlices(u8, @as([]const u8, &.{}), zero);
 
-            const one = try parseFromSlice([]u8, gpa, "&.{'a'}");
+            const one = try parseFromSlice([]u8, gpa, "&.{'a'}", .{});
             defer parseFree(gpa, one);
             try std.testing.expectEqualSlices(u8, &.{'a'}, one);
 
-            const two = try parseFromSlice([]const u8, gpa, "&.{'a', 'b'}");
+            const two = try parseFromSlice([]const u8, gpa, "&.{'a', 'b'}", .{});
             defer parseFree(gpa, two);
             try std.testing.expectEqualSlices(u8, &.{ 'a', 'b' }, two);
 
-            const two_comma = try parseFromSlice([]const u8, gpa, "&.{'a', 'b',}");
+            const two_comma = try parseFromSlice([]const u8, gpa, "&.{'a', 'b',}", .{});
             defer parseFree(gpa, two_comma);
             try std.testing.expectEqualSlices(u8, &.{ 'a', 'b' }, two_comma);
 
-            const three = try parseFromSlice([]u8, gpa, "&.{'a', 'b', 'c'}");
+            const three = try parseFromSlice([]u8, gpa, "&.{'a', 'b', 'c'}", .{});
             defer parseFree(gpa, three);
             try std.testing.expectEqualSlices(u8, &.{ 'a', 'b', 'c' }, three);
 
-            const sentinel = try parseFromSlice([:'z']const u8, gpa, "&.{'a', 'b', 'c'}");
+            const sentinel = try parseFromSlice([:'z']const u8, gpa, "&.{'a', 'b', 'c'}", .{});
             defer parseFree(gpa, sentinel);
             const expected_sentinel: [:'z']const u8 = &.{ 'a', 'b', 'c' };
             try std.testing.expectEqualSlices(u8, expected_sentinel, sentinel);
@@ -853,7 +870,7 @@ test "arrays and slices" {
     {
         // Arrays
         {
-            const parsed = try parseFromSlice([1][]const u8, gpa, ".{\"abc\"}");
+            const parsed = try parseFromSlice([1][]const u8, gpa, ".{\"abc\"}", .{});
             defer parseFree(gpa, parsed);
             const expected: [1][]const u8 = .{"abc"};
             try std.testing.expectEqualDeep(expected, parsed);
@@ -861,7 +878,7 @@ test "arrays and slices" {
 
         // Slice literals
         {
-            const parsed = try parseFromSlice([]const []const u8, gpa, "&.{\"abc\"}");
+            const parsed = try parseFromSlice([]const []const u8, gpa, "&.{\"abc\"}", .{});
             defer parseFree(gpa, parsed);
             const expected: []const []const u8 = &.{"abc"};
             try std.testing.expectEqualDeep(expected, parsed);
@@ -872,7 +889,7 @@ test "arrays and slices" {
     {
         // Arrays
         {
-            const sentinel = try parseFromSlice([1:2]u8, gpa, ".{1}");
+            const sentinel = try parseFromSlice([1:2]u8, gpa, ".{1}", .{});
             try std.testing.expectEqual(@as(usize, 1), sentinel.len);
             try std.testing.expectEqual(@as(u8, 1), sentinel[0]);
             try std.testing.expectEqual(@as(u8, 2), sentinel[1]);
@@ -880,7 +897,7 @@ test "arrays and slices" {
 
         // Slice literals
         {
-            const sentinel = try parseFromSlice([:2]align(4) u8, gpa, "&.{1}");
+            const sentinel = try parseFromSlice([:2]align(4) u8, gpa, "&.{1}", .{});
             defer parseFree(gpa, sentinel);
             try std.testing.expectEqual(@as(usize, 1), sentinel.len);
             try std.testing.expectEqual(@as(u8, 1), sentinel[0]);
@@ -893,7 +910,7 @@ test "arrays and slices" {
         var ast = try std.zig.Ast.parse(gpa, ".{'a', 'b', 'c'}", .zon);
         defer ast.deinit(gpa);
         var status: Status = .success;
-        try std.testing.expectError(error.Type, parseFromAst([0]u8, gpa, &ast, &status));
+        try std.testing.expectError(error.Type, parseFromAst([0]u8, gpa, &ast, &status, .{}));
         try std.testing.expectEqualStrings(@typeName([0]u8), status.expected_type.name);
         const node = status.expected_type.node;
         const main_tokens = ast.nodes.items(.main_token);
@@ -912,7 +929,7 @@ test "arrays and slices" {
         var ast = try std.zig.Ast.parse(gpa, ".{'a', 'b'}", .zon);
         defer ast.deinit(gpa);
         var status: Status = .success;
-        try std.testing.expectError(error.Type, parseFromAst([1]u8, gpa, &ast, &status));
+        try std.testing.expectError(error.Type, parseFromAst([1]u8, gpa, &ast, &status, .{}));
         try std.testing.expectEqualStrings(@typeName([1]u8), status.expected_type.name);
         const node = status.expected_type.node;
         const main_tokens = ast.nodes.items(.main_token);
@@ -931,7 +948,7 @@ test "arrays and slices" {
         var ast = try std.zig.Ast.parse(gpa, ".{'a'}", .zon);
         defer ast.deinit(gpa);
         var status: Status = .success;
-        try std.testing.expectError(error.Type, parseFromAst([2]u8, gpa, &ast, &status));
+        try std.testing.expectError(error.Type, parseFromAst([2]u8, gpa, &ast, &status, .{}));
         try std.testing.expectEqualStrings(@typeName([2]u8), status.expected_type.name);
         const node = status.expected_type.node;
         const main_tokens = ast.nodes.items(.main_token);
@@ -950,7 +967,7 @@ test "arrays and slices" {
         var ast = try std.zig.Ast.parse(gpa, ".{}", .zon);
         defer ast.deinit(gpa);
         var status: Status = .success;
-        try std.testing.expectError(error.Type, parseFromAst([3]u8, gpa, &ast, &status));
+        try std.testing.expectError(error.Type, parseFromAst([3]u8, gpa, &ast, &status, .{}));
         try std.testing.expectEqualStrings(@typeName([3]u8), status.expected_type.name);
         const node = status.expected_type.node;
         const main_tokens = ast.nodes.items(.main_token);
@@ -971,7 +988,7 @@ test "arrays and slices" {
             var ast = try std.zig.Ast.parse(gpa, ".{'a', 'b', 'c'}", .zon);
             defer ast.deinit(gpa);
             var status: Status = .success;
-            try std.testing.expectError(error.Type, parseFromAst([3]bool, gpa, &ast, &status));
+            try std.testing.expectError(error.Type, parseFromAst([3]bool, gpa, &ast, &status, .{}));
             try std.testing.expectEqualStrings(@typeName(bool), status.expected_type.name);
             const node = status.expected_type.node;
             const main_tokens = ast.nodes.items(.main_token);
@@ -990,7 +1007,7 @@ test "arrays and slices" {
             var ast = try std.zig.Ast.parse(gpa, "&.{'a', 'b', 'c'}", .zon);
             defer ast.deinit(gpa);
             var status: Status = .success;
-            try std.testing.expectError(error.Type, parseFromAst([]bool, gpa, &ast, &status));
+            try std.testing.expectError(error.Type, parseFromAst([]bool, gpa, &ast, &status, .{}));
             try std.testing.expectEqualStrings(@typeName(bool), status.expected_type.name);
             const node = status.expected_type.node;
             const main_tokens = ast.nodes.items(.main_token);
@@ -1012,7 +1029,7 @@ test "arrays and slices" {
             var ast = try std.zig.Ast.parse(gpa, "'a'", .zon);
             defer ast.deinit(gpa);
             var status: Status = .success;
-            try std.testing.expectError(error.Type, parseFromAst([3]u8, gpa, &ast, &status));
+            try std.testing.expectError(error.Type, parseFromAst([3]u8, gpa, &ast, &status, .{}));
             try std.testing.expectEqualStrings(@typeName([3]u8), status.expected_type.name);
             const node = status.expected_type.node;
             const main_tokens = ast.nodes.items(.main_token);
@@ -1031,7 +1048,7 @@ test "arrays and slices" {
             var ast = try std.zig.Ast.parse(gpa, "'a'", .zon);
             defer ast.deinit(gpa);
             var status: Status = .success;
-            try std.testing.expectError(error.Type, parseFromAst([]u8, gpa, &ast, &status));
+            try std.testing.expectError(error.Type, parseFromAst([]u8, gpa, &ast, &status, .{}));
             try std.testing.expectEqualStrings(@typeName([]u8), status.expected_type.name);
             const node = status.expected_type.node;
             const main_tokens = ast.nodes.items(.main_token);
@@ -1053,7 +1070,7 @@ test "arrays and slices" {
             var ast = try std.zig.Ast.parse(gpa, "&.{'a', 'b', 'c'}", .zon);
             defer ast.deinit(gpa);
             var status: Status = .success;
-            try std.testing.expectError(error.Type, parseFromAst([3]bool, gpa, &ast, &status));
+            try std.testing.expectError(error.Type, parseFromAst([3]bool, gpa, &ast, &status, .{}));
             try std.testing.expectEqualStrings(@typeName([3]bool), status.expected_type.name);
             const node = status.expected_type.node;
             const main_tokens = ast.nodes.items(.main_token);
@@ -1072,7 +1089,7 @@ test "arrays and slices" {
             var ast = try std.zig.Ast.parse(gpa, ".{'a', 'b', 'c'}", .zon);
             defer ast.deinit(gpa);
             var status: Status = .success;
-            try std.testing.expectError(error.Type, parseFromAst([]bool, gpa, &ast, &status));
+            try std.testing.expectError(error.Type, parseFromAst([]bool, gpa, &ast, &status, .{}));
             try std.testing.expectEqualStrings(@typeName([]bool), status.expected_type.name);
             const node = status.expected_type.node;
             const main_tokens = ast.nodes.items(.main_token);
@@ -1212,14 +1229,14 @@ test "string literal" {
 
     // Basic string literal
     {
-        const parsed = try parseFromSlice([]const u8, gpa, "\"abc\"");
+        const parsed = try parseFromSlice([]const u8, gpa, "\"abc\"", .{});
         defer parseFree(gpa, parsed);
         try std.testing.expectEqualSlices(u8, @as([]const u8, "abc"), parsed);
     }
 
     // String literal with escape characters
     {
-        const parsed = try parseFromSlice([]const u8, gpa, "\"ab\\nc\"");
+        const parsed = try parseFromSlice([]const u8, gpa, "\"ab\\nc\"", .{});
         defer parseFree(gpa, parsed);
         try std.testing.expectEqualSlices(u8, @as([]const u8, "ab\nc"), parsed);
     }
@@ -1229,7 +1246,7 @@ test "string literal" {
         var ast = try std.zig.Ast.parse(gpa, "\"abcd\"", .zon);
         defer ast.deinit(gpa);
         var status: Status = .success;
-        try std.testing.expectError(error.Type, parseFromAst([]u8, gpa, &ast, &status));
+        try std.testing.expectError(error.Type, parseFromAst([]u8, gpa, &ast, &status, .{}));
         try std.testing.expectEqualStrings(@typeName([]u8), status.expected_type.name);
         const node = status.expected_type.node;
         const main_tokens = ast.nodes.items(.main_token);
@@ -1245,7 +1262,7 @@ test "string literal" {
 
     // Zero termianted slices
     {
-        const parsed: [:0]const u8 = try parseFromSlice([:0]const u8, gpa, "\"abc\"");
+        const parsed: [:0]const u8 = try parseFromSlice([:0]const u8, gpa, "\"abc\"", .{});
         defer parseFree(gpa, parsed);
         try std.testing.expectEqualSlices(u8, "abc", parsed);
         try std.testing.expectEqual(@as(u8, 0), parsed[3]);
@@ -1256,7 +1273,7 @@ test "string literal" {
         var ast = try std.zig.Ast.parse(gpa, "\"foo\"", .zon);
         defer ast.deinit(gpa);
         var status: Status = .success;
-        try std.testing.expectError(error.Type, parseFromAst([:1]const u8, gpa, &ast, &status));
+        try std.testing.expectError(error.Type, parseFromAst([:1]const u8, gpa, &ast, &status, .{}));
         try std.testing.expectEqualStrings(@typeName([:1]const u8), status.expected_type.name);
         const node = status.expected_type.node;
         const main_tokens = ast.nodes.items(.main_token);
@@ -1275,7 +1292,7 @@ test "string literal" {
         var ast = try std.zig.Ast.parse(gpa, "\"\\a\"", .zon);
         defer ast.deinit(gpa);
         var status: Status = .success;
-        try std.testing.expectError(error.Type, parseFromAst([]const u8, gpa, &ast, &status));
+        try std.testing.expectError(error.Type, parseFromAst([]const u8, gpa, &ast, &status, .{}));
         const node = status.invalid_string_literal.node;
         const main_tokens = ast.nodes.items(.main_token);
         const token = main_tokens[node];
@@ -1293,7 +1310,7 @@ test "string literal" {
         var ast = try std.zig.Ast.parse(gpa, "\"a\"", .zon);
         defer ast.deinit(gpa);
         var status: Status = .success;
-        try std.testing.expectError(error.Type, parseFromAst([]const i8, gpa, &ast, &status));
+        try std.testing.expectError(error.Type, parseFromAst([]const i8, gpa, &ast, &status, .{}));
         try std.testing.expectEqualStrings(@typeName([]const i8), status.expected_type.name);
         const node = status.expected_type.node;
         const main_tokens = ast.nodes.items(.main_token);
@@ -1312,7 +1329,7 @@ test "string literal" {
         var ast = try std.zig.Ast.parse(gpa, "\"abc\"", .zon);
         defer ast.deinit(gpa);
         var status: Status = .success;
-        try std.testing.expectError(error.Type, parseFromAst([]align(2) const u8, gpa, &ast, &status));
+        try std.testing.expectError(error.Type, parseFromAst([]align(2) const u8, gpa, &ast, &status, .{}));
         try std.testing.expectEqualStrings(@typeName([]align(2) const u8), status.expected_type.name);
         const node = status.expected_type.node;
         const main_tokens = ast.nodes.items(.main_token);
@@ -1329,7 +1346,7 @@ test "string literal" {
     // TODO: ...
     // // Multi line strins
     // {
-    //     const parsed = try parseFromSlice([]const u8, gpa, "\\foo\\bar");
+    //     const parsed = try parseFromSlice([]const u8, gpa, "\\foo\\bar", .{});
     //     defer parseFree(gpa, parsed);
     //     try std.testing.expectEqualSlices(u8, "foo\nbar", parsed);
     // }
@@ -1423,16 +1440,16 @@ test "enum literals" {
     };
 
     // Tags that exist
-    try std.testing.expectEqual(Enum.foo, try parseFromSlice(Enum, gpa, ".foo"));
-    try std.testing.expectEqual(Enum.bar, try parseFromSlice(Enum, gpa, ".bar"));
-    try std.testing.expectEqual(Enum.baz, try parseFromSlice(Enum, gpa, ".baz"));
+    try std.testing.expectEqual(Enum.foo, try parseFromSlice(Enum, gpa, ".foo", .{}));
+    try std.testing.expectEqual(Enum.bar, try parseFromSlice(Enum, gpa, ".bar", .{}));
+    try std.testing.expectEqual(Enum.baz, try parseFromSlice(Enum, gpa, ".baz", .{}));
 
     // Bad tag
     {
         var ast = try std.zig.Ast.parse(gpa, ".qux", .zon);
         defer ast.deinit(gpa);
         var status: Status = .success;
-        try std.testing.expectError(error.Type, parseFromAst(Enum, gpa, &ast, &status));
+        try std.testing.expectError(error.Type, parseFromAst(Enum, gpa, &ast, &status, .{}));
         try std.testing.expectEqualSlices(u8, status.cannot_represent.name, @typeName(Enum));
         const node = status.cannot_represent.node;
         const main_tokens = ast.nodes.items(.main_token);
@@ -1451,7 +1468,7 @@ test "enum literals" {
         var ast = try std.zig.Ast.parse(gpa, "true", .zon);
         defer ast.deinit(gpa);
         var status: Status = .success;
-        try std.testing.expectError(error.Type, parseFromAst(Enum, gpa, &ast, &status));
+        try std.testing.expectError(error.Type, parseFromAst(Enum, gpa, &ast, &status, .{}));
         try std.testing.expectEqualStrings(@typeName(Enum), status.expected_type.name);
         const node = status.expected_type.node;
         const main_tokens = ast.nodes.items(.main_token);
@@ -1485,18 +1502,18 @@ test "@enumFromInt" {
     };
 
     // Test parsing numbers as enums
-    try std.testing.expectEqual(@as(Enum, @enumFromInt(0)), try parseFromSlice(Enum, gpa, "@enumFromInt(0)"));
-    try std.testing.expectEqual(@as(Enum, @enumFromInt(3)), try parseFromSlice(Enum, gpa, "@enumFromInt(3)"));
-    try std.testing.expectEqual(@as(SignedEnum, @enumFromInt(0)), try parseFromSlice(SignedEnum, gpa, "@enumFromInt(0)"));
-    try std.testing.expectEqual(@as(SignedEnum, @enumFromInt(-3)), try parseFromSlice(SignedEnum, gpa, "@enumFromInt(-3)"));
-    try std.testing.expectEqual(@as(NonExhaustive, @enumFromInt(123)), try parseFromSlice(NonExhaustive, gpa, "@enumFromInt(123)"));
+    try std.testing.expectEqual(@as(Enum, @enumFromInt(0)), try parseFromSlice(Enum, gpa, "@enumFromInt(0)", .{}));
+    try std.testing.expectEqual(@as(Enum, @enumFromInt(3)), try parseFromSlice(Enum, gpa, "@enumFromInt(3)", .{}));
+    try std.testing.expectEqual(@as(SignedEnum, @enumFromInt(0)), try parseFromSlice(SignedEnum, gpa, "@enumFromInt(0)", .{}));
+    try std.testing.expectEqual(@as(SignedEnum, @enumFromInt(-3)), try parseFromSlice(SignedEnum, gpa, "@enumFromInt(-3)", .{}));
+    try std.testing.expectEqual(@as(NonExhaustive, @enumFromInt(123)), try parseFromSlice(NonExhaustive, gpa, "@enumFromInt(123)", .{}));
 
     // Bad tag
     {
         var ast = try std.zig.Ast.parse(gpa, "@enumFromInt(2)", .zon);
         defer ast.deinit(gpa);
         var status: Status = .success;
-        try std.testing.expectError(error.Type, parseFromAst(Enum, gpa, &ast, &status));
+        try std.testing.expectError(error.Type, parseFromAst(Enum, gpa, &ast, &status, .{}));
         try std.testing.expectEqualSlices(u8, status.cannot_represent.name, @typeName(Enum));
         const node = status.cannot_represent.node;
         const main_tokens = ast.nodes.items(.main_token);
@@ -1515,7 +1532,7 @@ test "@enumFromInt" {
         var ast = try std.zig.Ast.parse(gpa, "@enumFromInt(256)", .zon);
         defer ast.deinit(gpa);
         var status: Status = .success;
-        try std.testing.expectError(error.Type, parseFromAst(Enum, gpa, &ast, &status));
+        try std.testing.expectError(error.Type, parseFromAst(Enum, gpa, &ast, &status, .{}));
         try std.testing.expectEqualSlices(u8, status.cannot_represent.name, @typeName(Enum));
         const node = status.cannot_represent.node;
         const main_tokens = ast.nodes.items(.main_token);
@@ -1534,7 +1551,7 @@ test "@enumFromInt" {
         var ast = try std.zig.Ast.parse(gpa, "@enumFromInt(-3)", .zon);
         defer ast.deinit(gpa);
         var status: Status = .success;
-        try std.testing.expectError(error.Type, parseFromAst(Enum, gpa, &ast, &status));
+        try std.testing.expectError(error.Type, parseFromAst(Enum, gpa, &ast, &status, .{}));
         try std.testing.expectEqualSlices(u8, status.cannot_represent.name, @typeName(Enum));
         const node = status.cannot_represent.node;
         const main_tokens = ast.nodes.items(.main_token);
@@ -1553,7 +1570,7 @@ test "@enumFromInt" {
         var ast = try std.zig.Ast.parse(gpa, "@enumFromInt(1.5)", .zon);
         defer ast.deinit(gpa);
         var status: Status = .success;
-        try std.testing.expectError(error.Type, parseFromAst(Enum, gpa, &ast, &status));
+        try std.testing.expectError(error.Type, parseFromAst(Enum, gpa, &ast, &status, .{}));
         try std.testing.expectEqualSlices(u8, status.cannot_represent.name, @typeName(Enum));
         const node = status.cannot_represent.node;
         const main_tokens = ast.nodes.items(.main_token);
@@ -1572,7 +1589,7 @@ test "@enumFromInt" {
         var ast = try std.zig.Ast.parse(gpa, "@fooBarBaz(1)", .zon);
         defer ast.deinit(gpa);
         var status: Status = .success;
-        try std.testing.expectError(error.Type, parseFromAst(Enum, gpa, &ast, &status));
+        try std.testing.expectError(error.Type, parseFromAst(Enum, gpa, &ast, &status, .{}));
         try std.testing.expectEqualSlices(u8, status.unsupported_builtin.name, "@fooBarBaz");
         const node = status.unsupported_builtin.node;
         const main_tokens = ast.nodes.items(.main_token);
@@ -1591,7 +1608,7 @@ test "@enumFromInt" {
         var ast = try std.zig.Ast.parse(gpa, "@enumFromInt(1, 2)", .zon);
         defer ast.deinit(gpa);
         var status: Status = .success;
-        try std.testing.expectError(error.Type, parseFromAst(Enum, gpa, &ast, &status));
+        try std.testing.expectError(error.Type, parseFromAst(Enum, gpa, &ast, &status, .{}));
         try std.testing.expectEqual(status.bad_arg_count.expected, 1);
         const node = status.bad_arg_count.node;
         const main_tokens = ast.nodes.items(.main_token);
@@ -1610,7 +1627,7 @@ test "@enumFromInt" {
         var ast = try std.zig.Ast.parse(gpa, "1", .zon);
         defer ast.deinit(gpa);
         var status: Status = .success;
-        try std.testing.expectError(error.Type, parseFromAst(Enum, gpa, &ast, &status));
+        try std.testing.expectError(error.Type, parseFromAst(Enum, gpa, &ast, &status, .{}));
         try std.testing.expectEqualStrings(@typeName(Enum), status.expected_type.name);
         const node = status.expected_type.node;
         const main_tokens = ast.nodes.items(.main_token);
@@ -1728,15 +1745,15 @@ test "parse bool" {
     const gpa = std.testing.allocator;
 
     // Correct floats
-    try std.testing.expectEqual(true, try parseFromSlice(bool, gpa, "true"));
-    try std.testing.expectEqual(false, try parseFromSlice(bool, gpa, "false"));
+    try std.testing.expectEqual(true, try parseFromSlice(bool, gpa, "true", .{}));
+    try std.testing.expectEqual(false, try parseFromSlice(bool, gpa, "false", .{}));
 
     // Errors
     {
         var ast = try std.zig.Ast.parse(gpa, " foo", .zon);
         defer ast.deinit(gpa);
         var status: Status = .success;
-        try std.testing.expectError(error.Type, parseFromAst(bool, gpa, &ast, &status));
+        try std.testing.expectError(error.Type, parseFromAst(bool, gpa, &ast, &status, .{}));
         try std.testing.expectEqualStrings(@typeName(bool), status.expected_type.name);
         const node = status.expected_type.node;
         const main_tokens = ast.nodes.items(.main_token);
@@ -1753,7 +1770,7 @@ test "parse bool" {
         var ast = try std.zig.Ast.parse(gpa, "123", .zon);
         defer ast.deinit(gpa);
         var status: Status = .success;
-        try std.testing.expectError(error.Type, parseFromAst(bool, gpa, &ast, &status));
+        try std.testing.expectError(error.Type, parseFromAst(bool, gpa, &ast, &status, .{}));
         try std.testing.expectEqualStrings(@typeName(bool), status.expected_type.name);
         const node = status.expected_type.node;
         const main_tokens = ast.nodes.items(.main_token);
@@ -1972,43 +1989,43 @@ test "parse int" {
     const gpa = std.testing.allocator;
 
     // Test various numbers and types
-    try std.testing.expectEqual(@as(u8, 10), try parseFromSlice(u8, gpa, "10"));
-    try std.testing.expectEqual(@as(i16, 24), try parseFromSlice(i16, gpa, "24"));
-    try std.testing.expectEqual(@as(i14, -4), try parseFromSlice(i14, gpa, "-4"));
-    try std.testing.expectEqual(@as(i32, -123), try parseFromSlice(i32, gpa, "-123"));
+    try std.testing.expectEqual(@as(u8, 10), try parseFromSlice(u8, gpa, "10", .{}));
+    try std.testing.expectEqual(@as(i16, 24), try parseFromSlice(i16, gpa, "24", .{}));
+    try std.testing.expectEqual(@as(i14, -4), try parseFromSlice(i14, gpa, "-4", .{}));
+    try std.testing.expectEqual(@as(i32, -123), try parseFromSlice(i32, gpa, "-123", .{}));
 
     // Test limits
-    try std.testing.expectEqual(@as(i8, 127), try parseFromSlice(i8, gpa, "127"));
-    try std.testing.expectEqual(@as(i8, -128), try parseFromSlice(i8, gpa, "-128"));
+    try std.testing.expectEqual(@as(i8, 127), try parseFromSlice(i8, gpa, "127", .{}));
+    try std.testing.expectEqual(@as(i8, -128), try parseFromSlice(i8, gpa, "-128", .{}));
 
     // Test characters
-    try std.testing.expectEqual(@as(u8, 'a'), try parseFromSlice(u8, gpa, "'a'"));
-    try std.testing.expectEqual(@as(u8, 'z'), try parseFromSlice(u8, gpa, "'z'"));
+    try std.testing.expectEqual(@as(u8, 'a'), try parseFromSlice(u8, gpa, "'a'", .{}));
+    try std.testing.expectEqual(@as(u8, 'z'), try parseFromSlice(u8, gpa, "'z'", .{}));
 
     // Test big integers
     try std.testing.expectEqual(
         @as(u65, 36893488147419103231),
-        try parseFromSlice(u65, gpa, "36893488147419103231"),
+        try parseFromSlice(u65, gpa, "36893488147419103231", .{}),
     );
     try std.testing.expectEqual(
         @as(u65, 36893488147419103231),
-        try parseFromSlice(u65, gpa, "368934_881_474191032_31"),
+        try parseFromSlice(u65, gpa, "368934_881_474191032_31", .{}),
     );
 
     // Test big integer limits
     try std.testing.expectEqual(
         @as(i66, 36893488147419103231),
-        try parseFromSlice(i66, gpa, "36893488147419103231"),
+        try parseFromSlice(i66, gpa, "36893488147419103231", .{}),
     );
     try std.testing.expectEqual(
         @as(i66, -36893488147419103232),
-        try parseFromSlice(i66, gpa, "-36893488147419103232"),
+        try parseFromSlice(i66, gpa, "-36893488147419103232", .{}),
     );
     {
         var ast = try std.zig.Ast.parse(gpa, "36893488147419103232", .zon);
         defer ast.deinit(gpa);
         var status: Status = .success;
-        try std.testing.expectError(error.Type, parseFromAst(i66, gpa, &ast, &status));
+        try std.testing.expectError(error.Type, parseFromAst(i66, gpa, &ast, &status, .{}));
         try std.testing.expectEqualSlices(u8, status.cannot_represent.name, @typeName(i66));
         const node = status.cannot_represent.node;
         const main_tokens = ast.nodes.items(.main_token);
@@ -2025,7 +2042,7 @@ test "parse int" {
         var ast = try std.zig.Ast.parse(gpa, "-36893488147419103233", .zon);
         defer ast.deinit(gpa);
         var status: Status = .success;
-        try std.testing.expectError(error.Type, parseFromAst(i66, gpa, &ast, &status));
+        try std.testing.expectError(error.Type, parseFromAst(i66, gpa, &ast, &status, .{}));
         try std.testing.expectEqualSlices(u8, status.cannot_represent.name, @typeName(i66));
         const node = status.cannot_represent.node;
         const main_tokens = ast.nodes.items(.main_token);
@@ -2040,62 +2057,71 @@ test "parse int" {
     }
 
     // Test parsing whole number floats as integers
-    try std.testing.expectEqual(@as(i8, -1), try parseFromSlice(i8, gpa, "-1.0"));
-    try std.testing.expectEqual(@as(i8, 123), try parseFromSlice(i8, gpa, "123.0"));
+    try std.testing.expectEqual(@as(i8, -1), try parseFromSlice(i8, gpa, "-1.0", .{}));
+    try std.testing.expectEqual(@as(i8, 123), try parseFromSlice(i8, gpa, "123.0", .{}));
 
     // Test non-decimal integers
-    try std.testing.expectEqual(@as(i16, 0xff), try parseFromSlice(i16, gpa, "0xff"));
-    try std.testing.expectEqual(@as(i16, -0xff), try parseFromSlice(i16, gpa, "-0xff"));
-    try std.testing.expectEqual(@as(i16, 0o77), try parseFromSlice(i16, gpa, "0o77"));
-    try std.testing.expectEqual(@as(i16, -0o77), try parseFromSlice(i16, gpa, "-0o77"));
-    try std.testing.expectEqual(@as(i16, 0b11), try parseFromSlice(i16, gpa, "0b11"));
-    try std.testing.expectEqual(@as(i16, -0b11), try parseFromSlice(i16, gpa, "-0b11"));
+    try std.testing.expectEqual(@as(i16, 0xff), try parseFromSlice(i16, gpa, "0xff", .{}));
+    try std.testing.expectEqual(@as(i16, -0xff), try parseFromSlice(i16, gpa, "-0xff", .{}));
+    try std.testing.expectEqual(@as(i16, 0o77), try parseFromSlice(i16, gpa, "0o77", .{}));
+    try std.testing.expectEqual(@as(i16, -0o77), try parseFromSlice(i16, gpa, "-0o77", .{}));
+    try std.testing.expectEqual(@as(i16, 0b11), try parseFromSlice(i16, gpa, "0b11", .{}));
+    try std.testing.expectEqual(@as(i16, -0b11), try parseFromSlice(i16, gpa, "-0b11", .{}));
 
     // Test non-decimal big integers
     try std.testing.expectEqual(@as(u65, 0x1ffffffffffffffff), try parseFromSlice(
         u65,
         gpa,
         "0x1ffffffffffffffff",
+        .{},
     ));
     try std.testing.expectEqual(@as(i66, 0x1ffffffffffffffff), try parseFromSlice(
         i66,
         gpa,
         "0x1ffffffffffffffff",
+        .{},
     ));
     try std.testing.expectEqual(@as(i66, -0x1ffffffffffffffff), try parseFromSlice(
         i66,
         gpa,
         "-0x1ffffffffffffffff",
+        .{},
     ));
     try std.testing.expectEqual(@as(u65, 0x1ffffffffffffffff), try parseFromSlice(
         u65,
         gpa,
         "0o3777777777777777777777",
+        .{},
     ));
     try std.testing.expectEqual(@as(i66, 0x1ffffffffffffffff), try parseFromSlice(
         i66,
         gpa,
         "0o3777777777777777777777",
+        .{},
     ));
     try std.testing.expectEqual(@as(i66, -0x1ffffffffffffffff), try parseFromSlice(
         i66,
         gpa,
         "-0o3777777777777777777777",
+        .{},
     ));
     try std.testing.expectEqual(@as(u65, 0x1ffffffffffffffff), try parseFromSlice(
         u65,
         gpa,
         "0b11111111111111111111111111111111111111111111111111111111111111111",
+        .{},
     ));
     try std.testing.expectEqual(@as(i66, 0x1ffffffffffffffff), try parseFromSlice(
         i66,
         gpa,
         "0b11111111111111111111111111111111111111111111111111111111111111111",
+        .{},
     ));
     try std.testing.expectEqual(@as(i66, -0x1ffffffffffffffff), try parseFromSlice(
         i66,
         gpa,
         "-0b11111111111111111111111111111111111111111111111111111111111111111",
+        .{},
     ));
 
     // Failinig to parse as int
@@ -2103,7 +2129,7 @@ test "parse int" {
         var ast = try std.zig.Ast.parse(gpa, "true", .zon);
         defer ast.deinit(gpa);
         var status: Status = .success;
-        try std.testing.expectError(error.Type, parseFromAst(u8, gpa, &ast, &status));
+        try std.testing.expectError(error.Type, parseFromAst(u8, gpa, &ast, &status, .{}));
         try std.testing.expectEqualStrings(@typeName(u8), status.expected_type.name);
         const node = status.expected_type.node;
         const main_tokens = ast.nodes.items(.main_token);
@@ -2122,7 +2148,7 @@ test "parse int" {
         var ast = try std.zig.Ast.parse(gpa, "256", .zon);
         defer ast.deinit(gpa);
         var status: Status = .success;
-        try std.testing.expectError(error.Type, parseFromAst(u8, gpa, &ast, &status));
+        try std.testing.expectError(error.Type, parseFromAst(u8, gpa, &ast, &status, .{}));
         try std.testing.expectEqualSlices(u8, status.cannot_represent.name, @typeName(u8));
         const node = status.cannot_represent.node;
         const main_tokens = ast.nodes.items(.main_token);
@@ -2141,7 +2167,7 @@ test "parse int" {
         var ast = try std.zig.Ast.parse(gpa, "-129", .zon);
         defer ast.deinit(gpa);
         var status: Status = .success;
-        try std.testing.expectError(error.Type, parseFromAst(i8, gpa, &ast, &status));
+        try std.testing.expectError(error.Type, parseFromAst(i8, gpa, &ast, &status, .{}));
         try std.testing.expectEqualSlices(u8, status.cannot_represent.name, @typeName(i8));
         const node = status.cannot_represent.node;
         const main_tokens = ast.nodes.items(.main_token);
@@ -2160,7 +2186,7 @@ test "parse int" {
         var ast = try std.zig.Ast.parse(gpa, "-1", .zon);
         defer ast.deinit(gpa);
         var status: Status = .success;
-        try std.testing.expectError(error.Type, parseFromAst(u8, gpa, &ast, &status));
+        try std.testing.expectError(error.Type, parseFromAst(u8, gpa, &ast, &status, .{}));
         try std.testing.expectEqualSlices(u8, status.cannot_represent.name, @typeName(u8));
         const node = status.cannot_represent.node;
         const main_tokens = ast.nodes.items(.main_token);
@@ -2179,7 +2205,7 @@ test "parse int" {
         var ast = try std.zig.Ast.parse(gpa, "1.5", .zon);
         defer ast.deinit(gpa);
         var status: Status = .success;
-        try std.testing.expectError(error.Type, parseFromAst(u8, gpa, &ast, &status));
+        try std.testing.expectError(error.Type, parseFromAst(u8, gpa, &ast, &status, .{}));
         try std.testing.expectEqualSlices(u8, status.cannot_represent.name, @typeName(u8));
         const node = status.cannot_represent.node;
         const main_tokens = ast.nodes.items(.main_token);
@@ -2198,7 +2224,7 @@ test "parse int" {
         var ast = try std.zig.Ast.parse(gpa, "-1.0", .zon);
         defer ast.deinit(gpa);
         var status: Status = .success;
-        try std.testing.expectError(error.Type, parseFromAst(u8, gpa, &ast, &status));
+        try std.testing.expectError(error.Type, parseFromAst(u8, gpa, &ast, &status, .{}));
         try std.testing.expectEqualSlices(u8, status.cannot_represent.name, @typeName(u8));
         const node = status.cannot_represent.node;
         const main_tokens = ast.nodes.items(.main_token);
@@ -2217,51 +2243,53 @@ test "parse float" {
     const gpa = std.testing.allocator;
 
     // Test decimals
-    try std.testing.expectEqual(@as(f16, 0.5), try parseFromSlice(f16, gpa, "0.5"));
-    try std.testing.expectEqual(@as(f32, 123.456), try parseFromSlice(f32, gpa, "123.456"));
-    try std.testing.expectEqual(@as(f64, -123.456), try parseFromSlice(f64, gpa, "-123.456"));
-    try std.testing.expectEqual(@as(f128, 42.5), try parseFromSlice(f128, gpa, "42.5"));
+    try std.testing.expectEqual(@as(f16, 0.5), try parseFromSlice(f16, gpa, "0.5", .{}));
+    try std.testing.expectEqual(@as(f32, 123.456), try parseFromSlice(f32, gpa, "123.456", .{}));
+    try std.testing.expectEqual(@as(f64, -123.456), try parseFromSlice(f64, gpa, "-123.456", .{}));
+    try std.testing.expectEqual(@as(f128, 42.5), try parseFromSlice(f128, gpa, "42.5", .{}));
 
     // Test whole numbers with and without decimals
-    try std.testing.expectEqual(@as(f16, 5.0), try parseFromSlice(f16, gpa, "5.0"));
-    try std.testing.expectEqual(@as(f16, 5.0), try parseFromSlice(f16, gpa, "5"));
-    try std.testing.expectEqual(@as(f32, -102), try parseFromSlice(f32, gpa, "-102.0"));
-    try std.testing.expectEqual(@as(f32, -102), try parseFromSlice(f32, gpa, "-102"));
+    try std.testing.expectEqual(@as(f16, 5.0), try parseFromSlice(f16, gpa, "5.0", .{}));
+    try std.testing.expectEqual(@as(f16, 5.0), try parseFromSlice(f16, gpa, "5", .{}));
+    try std.testing.expectEqual(@as(f32, -102), try parseFromSlice(f32, gpa, "-102.0", .{}));
+    try std.testing.expectEqual(@as(f32, -102), try parseFromSlice(f32, gpa, "-102", .{}));
 
     // Test characters and negated characters
-    try std.testing.expectEqual(@as(f32, 'a'), try parseFromSlice(f32, gpa, "'a'"));
-    try std.testing.expectEqual(@as(f32, 'z'), try parseFromSlice(f32, gpa, "'z'"));
-    try std.testing.expectEqual(@as(f32, -'z'), try parseFromSlice(f32, gpa, "-'z'"));
+    try std.testing.expectEqual(@as(f32, 'a'), try parseFromSlice(f32, gpa, "'a'", .{}));
+    try std.testing.expectEqual(@as(f32, 'z'), try parseFromSlice(f32, gpa, "'z'", .{}));
+    try std.testing.expectEqual(@as(f32, -'z'), try parseFromSlice(f32, gpa, "-'z'", .{}));
 
     // Test big integers
     try std.testing.expectEqual(
         @as(f32, 36893488147419103231),
-        try parseFromSlice(f32, gpa, "36893488147419103231"),
+        try parseFromSlice(f32, gpa, "36893488147419103231", .{}),
     );
     try std.testing.expectEqual(
         @as(f32, -36893488147419103231),
-        try parseFromSlice(f32, gpa, "-36893488147419103231"),
+        try parseFromSlice(f32, gpa, "-36893488147419103231", .{}),
     );
     try std.testing.expectEqual(@as(f128, 0x1ffffffffffffffff), try parseFromSlice(
         f128,
         gpa,
         "0x1ffffffffffffffff",
+        .{},
     ));
     try std.testing.expectEqual(@as(f32, 0x1ffffffffffffffff), try parseFromSlice(
         f32,
         gpa,
         "0x1ffffffffffffffff",
+        .{},
     ));
 
     // Exponents, underscores
-    try std.testing.expectEqual(@as(f32, 123.0E+77), try parseFromSlice(f32, gpa, "12_3.0E+77"));
+    try std.testing.expectEqual(@as(f32, 123.0E+77), try parseFromSlice(f32, gpa, "12_3.0E+77", .{}));
 
     // Hexadecimal
-    try std.testing.expectEqual(@as(f32, 0x103.70p-5), try parseFromSlice(f32, gpa, "0x103.70p-5"));
-    try std.testing.expectEqual(@as(f32, -0x103.70), try parseFromSlice(f32, gpa, "-0x103.70"));
+    try std.testing.expectEqual(@as(f32, 0x103.70p-5), try parseFromSlice(f32, gpa, "0x103.70p-5", .{}));
+    try std.testing.expectEqual(@as(f32, -0x103.70), try parseFromSlice(f32, gpa, "-0x103.70", .{}));
     try std.testing.expectEqual(
         @as(f32, 0x1234_5678.9ABC_CDEFp-10),
-        try parseFromSlice(f32, gpa, "0x1234_5678.9ABC_CDEFp-10"),
+        try parseFromSlice(f32, gpa, "0x1234_5678.9ABC_CDEFp-10", .{}),
     );
 }
 
