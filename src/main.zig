@@ -106,15 +106,8 @@ pub fn parseFree(gpa: Allocator, value: anytype) void {
         .Struct => |Struct| inline for (Struct.fields) |field| {
             parseFree(gpa, @field(value, field.name));
         },
-        .Union => |Union| {
-            const Tag = Union.tag_type orelse failFreeType(Value);
-            inline for (@typeInfo(Tag).Enum.fields, 0..) |field, i| {
-                const tag: Tag = @enumFromInt(i);
-                if (value == tag) {
-                    parseFree(gpa, @field(value, field.name));
-                    break;
-                }
-            }
+        .Union => switch (value) {
+            inline else => |_, tag| parseFree(gpa, @field(value, @tagName(tag))),
         },
         .Optional => if (value) |some| {
             parseFree(gpa, some);
@@ -281,17 +274,17 @@ fn parseUnion(self: *Parser, comptime T: type, node: NodeIndex) Error!T {
             return self.failUnknownField(T, node, bytes);
 
         // Initialize the union from the given field.
-        inline for (field_infos, 0..) |field_info, i| {
-            if (i == field_index) {
+        switch (field_index) {
+            inline 0...field_infos.len - 1 => |i| {
                 // Fail if the field is not void
-                if (field_info.type != void)
+                if (field_infos[i].type != void)
                     return self.failExpectedType(T, node);
 
                 // Instantiate the union
-                return @unionInit(T, field_info.name, {});
-            }
+                return @unionInit(T, field_infos[i].name, {});
+            },
+            else => unreachable,
         }
-        unreachable;
     } else {
         var buf: [2]NodeIndex = undefined;
         const field_nodes = try self.elementsOrFields(T, &buf, node);
@@ -303,18 +296,17 @@ fn parseUnion(self: *Parser, comptime T: type, node: NodeIndex) Error!T {
         // Fill in the field we found
         const field_node = field_nodes[0];
         const name = self.parseIdentifier(self.ast.firstToken(field_node) - 2);
-        const i = field_indices.get(name) orelse
+        const field_index = field_indices.get(name) orelse
             return self.failUnknownField(T, field_node, name);
 
-        inline for (field_infos, 0..) |field_info, j| {
-            if (i == j) {
-                const value = try self.parseExpr(field_info.type, field_node);
-                return @unionInit(T, field_info.name, value);
-            }
+        switch (field_index) {
+            inline 0...field_infos.len - 1 => |i| {
+                const value = try self.parseExpr(field_infos[i].type, field_node);
+                return @unionInit(T, field_infos[i].name, value);
+            },
+            else => unreachable,
         }
     }
-
-    unreachable;
 }
 
 test "unions" {
@@ -506,6 +498,7 @@ fn elementsOrFields(
     }
 }
 
+// XXX: test errors on duplicate fields!
 // TODO: can bench with and without comptime string map later?
 fn parseStruct(self: *Parser, comptime T: type, node: NodeIndex) Error!T {
     // TODO: some of the array errors point to the brace instead of 0?
@@ -541,11 +534,9 @@ fn parseStruct(self: *Parser, comptime T: type, node: NodeIndex) Error!T {
         // We now know the array is not zero sized (assert this so the code compiles)
         if (field_found.len == 0) unreachable;
 
-        inline for (field_infos, 0..) |field_info, j| {
-            if (i == j) {
-                @field(result, field_info.name) = try self.parseExpr(field_info.type, field_node);
-                break;
-            }
+        switch (i) {
+            inline 0...(field_infos.len - 1) => |j| @field(result, field_infos[j].name) = try self.parseExpr(field_infos[j].type, field_node),
+            else => unreachable,
         }
 
         field_found[i] = true;
