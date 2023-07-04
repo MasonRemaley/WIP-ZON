@@ -49,6 +49,10 @@ pub const Status = union(enum) {
         type_name: []const u8,
         field_name: []const u8,
     },
+    duplicate_field: struct {
+        node: NodeIndex,
+        field_name: []const u8,
+    },
     unsupported_builtin: struct {
         node: NodeIndex,
         name: []const u8,
@@ -107,7 +111,9 @@ pub fn parseFree(gpa: Allocator, value: anytype) void {
             parseFree(gpa, @field(value, field.name));
         },
         .Union => switch (value) {
-            inline else => |_, tag| parseFree(gpa, @field(value, @tagName(tag))),
+            inline else => |_, tag| {
+                parseFree(gpa, @field(value, @tagName(tag)));
+            },
         },
         .Optional => if (value) |some| {
             parseFree(gpa, some);
@@ -498,7 +504,6 @@ fn elementsOrFields(
     }
 }
 
-// XXX: test errors on duplicate fields!
 // TODO: can bench with and without comptime string map later?
 fn parseStruct(self: *Parser, comptime T: type, node: NodeIndex) Error!T {
     // TODO: some of the array errors point to the brace instead of 0?
@@ -534,12 +539,15 @@ fn parseStruct(self: *Parser, comptime T: type, node: NodeIndex) Error!T {
         // We now know the array is not zero sized (assert this so the code compiles)
         if (field_found.len == 0) unreachable;
 
+        if (field_found[i]) {
+            return self.failDuplicateField(name, field_node);
+        }
+        field_found[i] = true;
+
         switch (i) {
             inline 0...(field_infos.len - 1) => |j| @field(result, field_infos[j].name) = try self.parseExpr(field_infos[j].type, field_node),
             else => unreachable,
         }
-
-        field_found[i] = true;
     }
 
     // Fill in any missing default fields
@@ -601,6 +609,25 @@ test "structs" {
         try std.testing.expectEqualStrings(@typeName(Vec2), status.unknown_field.type_name);
         try std.testing.expectEqualStrings("z", status.unknown_field.field_name);
         const node = status.unknown_field.node;
+        const token = ast.firstToken(node) - 2;
+        const location = ast.tokenLocation(0, token);
+        try std.testing.expectEqual(Ast.Location{
+            .line = 0,
+            .column = 11,
+            .line_start = 0,
+            .line_end = 17,
+        }, location);
+    }
+
+    // Duplicate field
+    {
+        const Vec2 = struct { x: f32, y: f32 };
+        var ast = try std.zig.Ast.parse(gpa, ".{.x=1.5, .x=2.5}", .zon);
+        defer ast.deinit(gpa);
+        var status: Status = .success;
+        try std.testing.expectError(error.Type, parseFromAst(Vec2, gpa, &ast, &status, .{}));
+        try std.testing.expectEqualStrings("x", status.duplicate_field.field_name);
+        const node = status.duplicate_field.node;
         const token = ast.firstToken(node) - 2;
         const location = ast.tokenLocation(0, token);
         try std.testing.expectEqual(Ast.Location{
@@ -1686,6 +1713,14 @@ fn failMissingField(self: *Parser, comptime T: type, name: []const u8, node: Nod
     return self.fail(.{ .missing_field = .{
         .node = node,
         .type_name = @typeName(T),
+        .field_name = name,
+    } });
+}
+
+fn failDuplicateField(self: *Parser, name: []const u8, node: NodeIndex) error{Type} {
+    @setCold(true);
+    return self.fail(.{ .duplicate_field = .{
+        .node = node,
         .field_name = name,
     } });
 }
