@@ -5,12 +5,20 @@ pub const Options = struct {
 };
 
 pub fn stringify(value: anytype, options: Options, out_stream: anytype) !void {
-    _ = options; // XXX: ...
-
     // TODO: keep in sync with parseExpr
     switch (@typeInfo(@TypeOf(value))) {
         .Bool => return out_stream.writeAll(if (value) "true" else "false"),
-        // .Int, .Float => self.stringifyNumber(options, value, out_stream),
+        // XXX: decimal would be easier to read for cases like 0.5, is it not guaranteed to be exact?
+        .Float => return std.fmt.formatFloatScientific(value, .{}, out_stream),
+        .Int => return std.fmt.formatIntValue(value, "", .{}, out_stream),
+        // XXX: support parsing null as a type too!
+        // XXX: support vectors? error sets?
+        .Null => return out_stream.writeAll("null"),
+        .Void => return out_stream.writeAll("{}"),
+        .Optional => return if (value) |payload|
+            stringify(payload, options, out_stream)
+        else
+            out_stream.writeAll("null"),
         // .Enum => self.stringifyEnumLiteral(options, value, out_stream),
         // .Pointer => self.stringifyPointer(options, value, out_stream),
         // .Array => self.stringifyArray(options, value, out_stream),
@@ -19,8 +27,6 @@ pub fn stringify(value: anytype, options: Options, out_stream: anytype) !void {
         // else
         //     self.stringifyStruct(options, value, out_stream),
         // .Union => self.stringifyUnion(options, value, out_stream),
-        // .Optional => self.stringifyOptional(options, value, out_stream),
-        // .Void => self.stringifyVoid(options, value, out_stream),
 
         else => failToStringifyType(@TypeOf(value)),
     }
@@ -41,4 +47,10 @@ fn expectStringifyEqual(value: anytype, options: Options, expected: []const u8) 
 test "stringify basic" {
     try expectStringifyEqual(true, .{}, "true");
     try expectStringifyEqual(false, .{}, "false");
+    try expectStringifyEqual(@as(u32, 123), .{}, "123");
+    try expectStringifyEqual(@as(f32, 0.5), .{}, "5.0e-01");
+    try expectStringifyEqual(null, .{}, "null");
+    try expectStringifyEqual({}, .{}, "{}");
+    try expectStringifyEqual(@as(?bool, true), .{}, "true");
+    try expectStringifyEqual(@as(?bool, null), .{}, "null");
 }
