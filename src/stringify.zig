@@ -1,7 +1,28 @@
 const std = @import("std");
 
 pub const Options = struct {
-    // XXX: fill in
+    // XXX: clearer api?
+    indent_level: ?usize = 0,
+
+    pub fn outputIndent(self: @This(), out_stream: anytype) @TypeOf(out_stream).Error!void {
+        if (self.indent_level) |indent_level| {
+            try out_stream.writeByte('\n');
+            try out_stream.writeByteNTimes(' ', indent_level * 4);
+        }
+    }
+
+    pub fn indent(self: *@This()) void {
+        if (self.indent_level != null) {
+            self.indent_level.? += 1;
+        }
+    }
+
+    pub fn unindent(self: *@This(), out_stream: anytype) @TypeOf(out_stream).Error!void {
+        if (self.indent_level != null) {
+            self.indent_level.? -= 1;
+            try out_stream.writeByte('\n');
+        }
+    }
 };
 
 pub fn stringify(value: anytype, options: Options, out_stream: anytype) !void {
@@ -31,8 +52,23 @@ pub fn stringify(value: anytype, options: Options, out_stream: anytype) !void {
             try out_stream.writeByte('.');
             try out_stream.writeAll(@tagName(value));
         },
+        .Array => {
+            var child_options = options;
+            try out_stream.writeAll(".{");
+            if (value.len > 0) {
+                child_options.indent();
+                for (value, 0..) |item, i| {
+                    try child_options.outputIndent(out_stream);
+                    try stringify(item, child_options, out_stream);
+                    if (child_options.indent_level != null or i != value.len - 1) {
+                        try out_stream.writeByte(',');
+                    }
+                }
+                try child_options.unindent(out_stream);
+            }
+            try out_stream.writeByte('}');
+        },
         // .Pointer => self.stringifyPointer(options, value, out_stream),
-        // .Array => self.stringifyArray(options, value, out_stream),
         // .Struct => |Struct| if (Struct.is_tuple)
         //     self.stringifyTuple(options, value, out_stream)
         // else
@@ -47,6 +83,8 @@ fn failToStringifyType(comptime T: type) noreturn {
     @compileError("Unable to stringify type '" ++ @typeName(T) ++ "'");
 }
 
+// XXX: supply stringifyAlloc like json does?
+// XXX: explicit error type like output indent?
 fn expectStringifyEqual(value: anytype, options: Options, expected: []const u8) !void {
     const gpa = std.testing.allocator;
     var stringified = std.ArrayList(u8).init(gpa);
@@ -73,4 +111,9 @@ test "stringify basic" {
     try expectStringifyEqual(NonExhaustive.B, .{}, ".B");
     try expectStringifyEqual(@as(NonExhaustive, @enumFromInt(3)), .{}, "@enumFromInt(3)");
     try expectStringifyEqual(.abc, .{}, ".abc");
+    try expectStringifyEqual([_]u8{ 1, 2, 3 }, .{}, ".{\n    1,\n    2,\n    3,\n}");
+    // XXX: skip trailing comma if no newlines?
+    try expectStringifyEqual([_]u8{ 1, 2, 3 }, .{ .indent_level = null }, ".{1,2,3}");
+    try expectStringifyEqual([_]u8{}, .{}, ".{}");
+    try expectStringifyEqual([_]u8{}, .{ .indent_level = null }, ".{}");
 }
