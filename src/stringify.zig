@@ -1,7 +1,6 @@
 const std = @import("std");
 
 pub const Options = struct {
-    // XXX: clearer api? defaults?
     indent_level: ?usize = 0,
     strings: bool = true,
 
@@ -25,7 +24,7 @@ pub const Options = struct {
         }
     }
 
-    pub fn space(self: *@This(), out_stream: anytype) @TypeOf(out_stream).Error!void {
+    pub fn space(self: @This(), out_stream: anytype) @TypeOf(out_stream).Error!void {
         if (self.indent_level != null) {
             try out_stream.writeByte(' ');
         }
@@ -36,7 +35,6 @@ pub fn stringify(value: anytype, options: Options, out_stream: anytype) !void {
     // TODO: keep in sync with parseExpr
     switch (@typeInfo(@TypeOf(value))) {
         .Bool => try out_stream.writeAll(if (value) "true" else "false"),
-        // XXX: decimal would be easier to read for cases like 0.5, is it not guaranteed to be exact?
         .Float => try std.fmt.formatFloatScientific(value, .{}, out_stream),
         .Int => try std.fmt.formatIntValue(value, "", .{}, out_stream),
         // XXX: support parsing null as a type too!
@@ -77,15 +75,15 @@ pub fn stringify(value: anytype, options: Options, out_stream: anytype) !void {
                 try stringifyList(value, options, out_stream);
             }
         },
-        .Struct => |strct| {
+        .Struct => |Struct| {
             var child_options = options;
             try out_stream.writeAll(".{");
-            if (strct.fields.len > 0) {
+            if (Struct.fields.len > 0) {
                 child_options.indent();
-                inline for (strct.fields, 0..) |field, i| {
+                inline for (Struct.fields, 0..) |field, i| {
                     try child_options.outputIndent(out_stream);
 
-                    if (!strct.is_tuple) {
+                    if (!Struct.is_tuple) {
                         try out_stream.writeByte('.');
                         try out_stream.writeAll(field.name);
 
@@ -96,7 +94,7 @@ pub fn stringify(value: anytype, options: Options, out_stream: anytype) !void {
 
                     try stringify(@field(value, field.name), child_options, out_stream);
 
-                    if (child_options.indent_level != null or i != strct.fields.len - 1) {
+                    if (child_options.indent_level != null or i != Struct.fields.len - 1) {
                         try out_stream.writeByte(',');
                     }
                 }
@@ -104,7 +102,36 @@ pub fn stringify(value: anytype, options: Options, out_stream: anytype) !void {
             }
             try out_stream.writeAll("}");
         },
-        // .Union => self.stringifyUnion(options, value, out_stream),
+        .Union => |Union| {
+            if (Union.tag_type == null)
+                failToStringifyType(@TypeOf(value));
+
+            switch (value) {
+                inline else => |payload, tag| {
+                    if (@TypeOf(payload) == void) {
+                        try out_stream.writeByte('.');
+                        // XXX: can a union use a non exhaustive enum as its tag?
+                        try out_stream.writeAll(@tagName(tag));
+                    } else {
+                        try out_stream.writeAll(".{");
+                        try options.space(out_stream);
+
+                        try out_stream.writeByte('.');
+                        // XXX: can a union use a non exhaustive enum as its tag?
+                        try out_stream.writeAll(@tagName(tag));
+
+                        try options.space(out_stream);
+                        try out_stream.writeByte('=');
+                        try options.space(out_stream);
+
+                        try stringify(payload, options, out_stream);
+                        try options.space(out_stream);
+
+                        try out_stream.writeAll("}");
+                    }
+                },
+            }
+        },
 
         else => failToStringifyType(@TypeOf(value)),
     }
@@ -214,4 +241,14 @@ test "stringify basic" {
         \\    },
         \\}
     );
+
+    // Unions
+    const Union = union(enum) {
+        a: u8,
+        b: u32,
+        c: void,
+    };
+    try expectStringifyEqual(Union{ .a = 1.0 }, .{ .indent_level = null }, ".{.a=1}");
+    try expectStringifyEqual(Union{ .a = 1 }, .{}, ".{ .a = 1 }");
+    try expectStringifyEqual(@as(Union, .c), .{}, ".c");
 }

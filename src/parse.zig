@@ -119,6 +119,7 @@ pub fn parseFree(gpa: Allocator, value: anytype) void {
             parseFree(gpa, some);
         },
         .Void => {},
+        .Null => {},
         // TODO: ...
         else => failFreeType(Value),
     }
@@ -141,6 +142,7 @@ fn parseExpr(self: *Parser, comptime T: type, node: NodeIndex) Error!T {
         .Union => return self.parseUnion(T, node),
         .Optional => return self.parseOptional(T, node),
         .Void => return self.parseVoid(node),
+        // .Null => return self.parseNull(node),
 
         else => failToParseType(T),
     }
@@ -158,6 +160,22 @@ fn parseVoid(self: *Parser, node: NodeIndex) Error!void {
         },
         else => return self.failExpectedType(void, node),
     }
+}
+
+fn parseNull(self: *Parser, node: NodeIndex) error{Type}!void {
+    const tags = self.ast.nodes.items(.tag);
+    const main_tokens = self.ast.nodes.items(.main_token);
+    const token = main_tokens[node];
+    switch (tags[node]) {
+        .identifier => {
+            const bytes = self.ast.tokenSlice(token);
+            if (std.mem.eql(u8, bytes, "void")) {
+                return true;
+            }
+        },
+        else => {},
+    }
+    return self.failExpectedType(void, node);
 }
 
 test "void" {
@@ -208,6 +226,38 @@ test "void" {
         }, location);
     }
 }
+
+// TODO: see https://github.com/MasonRemaley/WIP-ZON/issues/3
+// test "null" {
+//     const gpa = std.testing.allocator;
+
+//     const Null = @TypeOf(null);
+//     const parsed: @TypeOf(null) = try parseFromSlice(Null, gpa, "null", .{});
+//     _ = parsed;
+
+//     // Freeing null is a noop, but it should compile!
+//     const free: @TypeOf(null) = try parseFromSlice(void, gpa, "null", .{});
+//     defer parseFree(gpa, free);
+
+//     // Other type
+//     {
+//         var ast = try std.zig.Ast.parse(gpa, "123", .zon);
+//         defer ast.deinit(gpa);
+//         var status: Status = .success;
+//         try std.testing.expectError(error.Type, parseFromAst(@TypeOf(null), gpa, &ast, &status, .{}));
+//         try std.testing.expectEqualStrings(@typeName(@TypeOf(null)), status.expected_type.name);
+//         const node = status.expected_type.node;
+//         const main_tokens = ast.nodes.items(.main_token);
+//         const token = main_tokens[node];
+//         const location = ast.tokenLocation(0, token);
+//         try std.testing.expectEqual(Ast.Location{
+//             .line = 0,
+//             .column = 0,
+//             .line_start = 0,
+//             .line_end = 3,
+//         }, location);
+//     }
+// }
 
 fn parseOptional(self: *Parser, comptime T: type, node: NodeIndex) Error!T {
     const Optional = @typeInfo(T).Optional;
