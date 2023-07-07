@@ -46,8 +46,7 @@ pub fn stringify(value: anytype, options: Options, out_stream: anytype) !void {
         else
             try out_stream.writeAll("null"),
         .Enum => if (std.enums.tagName(@TypeOf(value), value)) |name| {
-            try out_stream.writeByte('.');
-            try out_stream.writeAll(name);
+            try out_stream.print(".{}", .{std.zig.fmtId(name)});
         } else {
             try out_stream.writeAll("@enumFromInt(");
             try std.fmt.formatIntValue(@intFromEnum(value), "", .{}, out_stream);
@@ -84,8 +83,7 @@ pub fn stringify(value: anytype, options: Options, out_stream: anytype) !void {
                     try child_options.outputIndent(out_stream);
 
                     if (!Struct.is_tuple) {
-                        try out_stream.writeByte('.');
-                        try out_stream.writeAll(field.name);
+                        try out_stream.print(".{}", .{std.zig.fmtId(field.name)});
 
                         try child_options.space(out_stream);
                         try out_stream.writeByte('=');
@@ -109,16 +107,14 @@ pub fn stringify(value: anytype, options: Options, out_stream: anytype) !void {
             switch (value) {
                 inline else => |payload, tag| {
                     if (@TypeOf(payload) == void) {
-                        try out_stream.writeByte('.');
                         // XXX: can a union use a non exhaustive enum as its tag?
-                        try out_stream.writeAll(@tagName(tag));
+                        try out_stream.print(".{}", .{std.zig.fmtId(@tagName(tag))});
                     } else {
                         try out_stream.writeAll(".{");
                         try options.space(out_stream);
 
-                        try out_stream.writeByte('.');
                         // XXX: can a union use a non exhaustive enum as its tag?
-                        try out_stream.writeAll(@tagName(tag));
+                        try out_stream.print(".{}", .{std.zig.fmtId(@tagName(tag))});
 
                         try options.space(out_stream);
                         try out_stream.writeByte('=');
@@ -172,8 +168,9 @@ fn expectStringifyEqual(value: anytype, options: Options, expected: []const u8) 
 }
 
 test "stringify basic" {
-    const Exhaustive = enum { A, B };
-    const NonExhaustive = enum(u8) { A, B, _ };
+    // XXX: enum struct union union
+    const Exhaustive = enum { A, B, @"while" };
+    const NonExhaustive = enum(u8) { A, B, @"while", _ };
 
     // Primitives
     try expectStringifyEqual(true, .{}, "true");
@@ -188,6 +185,8 @@ test "stringify basic" {
     try expectStringifyEqual(NonExhaustive.B, .{}, ".B");
     try expectStringifyEqual(@as(NonExhaustive, @enumFromInt(3)), .{}, "@enumFromInt(3)");
     try expectStringifyEqual(.abc, .{}, ".abc");
+    try expectStringifyEqual(Exhaustive.@"while", .{}, ".@\"while\"");
+    try expectStringifyEqual(NonExhaustive.@"while", .{}, ".@\"while\"");
 
     // Arrays
     try expectStringifyEqual([_]u16{ 1, 2, 3 }, .{}, ".{\n    1,\n    2,\n    3,\n}");
@@ -210,16 +209,16 @@ test "stringify basic" {
     try expectStringifyEqual(.{}, .{}, ".{}");
     try expectStringifyEqual(.{}, .{ .indent_level = null }, ".{}");
     try expectStringifyEqual(
-        .{ .x = @as(u8, 1), .y = @as(u8, 2), .z = .{ .c = @as(u8, 3) } },
+        .{ .x = @as(u8, 1), .y = @as(u8, 2), .z = .{ .@"hello world" = @as(u8, 3) } },
         .{ .indent_level = null },
-        ".{.x=1,.y=2,.z=.{.c=3}}",
+        ".{.x=1,.y=2,.z=.{.@\"hello world\"=3}}",
     );
-    try expectStringifyEqual(.{ .x = @as(u8, 1), .y = @as(u8, 2), .z = .{ .c = @as(u8, 3) } }, .{},
+    try expectStringifyEqual(.{ .x = @as(u8, 1), .y = @as(u8, 2), .z = .{ .@"hello world" = @as(u8, 3) } }, .{},
         \\.{
         \\    .x = 1,
         \\    .y = 2,
         \\    .z = .{
-        \\        .c = 3,
+        \\        .@"hello world" = 3,
         \\    },
         \\}
     );
@@ -245,10 +244,14 @@ test "stringify basic" {
     // Unions
     const Union = union(enum) {
         a: u8,
-        b: u32,
+        @"hello world": u32,
         c: void,
+        @"void space": void,
     };
-    try expectStringifyEqual(Union{ .a = 1.0 }, .{ .indent_level = null }, ".{.a=1}");
+    try expectStringifyEqual(Union{ .a = 1 }, .{ .indent_level = null }, ".{.a=1}");
     try expectStringifyEqual(Union{ .a = 1 }, .{}, ".{ .a = 1 }");
+    try expectStringifyEqual(Union{ .@"hello world" = 1 }, .{ .indent_level = null }, ".{.@\"hello world\"=1}");
+    try expectStringifyEqual(Union{ .@"hello world" = 1 }, .{}, ".{ .@\"hello world\" = 1 }");
     try expectStringifyEqual(@as(Union, .c), .{}, ".c");
+    try expectStringifyEqual(@as(Union, .@"void space"), .{}, ".@\"void space\"");
 }

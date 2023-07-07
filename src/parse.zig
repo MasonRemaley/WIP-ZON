@@ -370,22 +370,26 @@ test "unions" {
 
     // Unions
     {
-        const Tagged = union(enum) { x: f32, y: bool, z };
-        const Untagged = union { x: f32, y: bool, z: void };
+        const Tagged = union(enum) { x: f32, @"y y": bool, z, @"z z" };
+        const Untagged = union { x: f32, @"y y": bool, z: void, @"z z": void };
 
         const tagged_x = try parseFromSlice(Tagged, gpa, ".{.x = 1.5}", .{});
         try std.testing.expectEqual(Tagged{ .x = 1.5 }, tagged_x);
-        const tagged_y = try parseFromSlice(Tagged, gpa, ".{.y = true}", .{});
-        try std.testing.expectEqual(Tagged{ .y = true }, tagged_y);
+        const tagged_y = try parseFromSlice(Tagged, gpa, ".{.@\"y y\" = true}", .{});
+        try std.testing.expectEqual(Tagged{ .@"y y" = true }, tagged_y);
         const tagged_z_shorthand = try parseFromSlice(Tagged, gpa, ".z", .{});
         try std.testing.expectEqual(@as(Tagged, .z), tagged_z_shorthand);
+        const tagged_zz_shorthand = try parseFromSlice(Tagged, gpa, ".@\"z z\"", .{});
+        try std.testing.expectEqual(@as(Tagged, .@"z z"), tagged_zz_shorthand);
         const tagged_z_explicit = try parseFromSlice(Tagged, gpa, ".{.z = {}}", .{});
         try std.testing.expectEqual(Tagged{ .z = {} }, tagged_z_explicit);
+        const tagged_zz_explicit = try parseFromSlice(Tagged, gpa, ".{.@\"z z\" = {}}", .{});
+        try std.testing.expectEqual(Tagged{ .@"z z" = {} }, tagged_zz_explicit);
 
         const untagged_x = try parseFromSlice(Untagged, gpa, ".{.x = 1.5}", .{});
         try std.testing.expect(untagged_x.x == 1.5);
-        const untagged_y = try parseFromSlice(Untagged, gpa, ".{.y = true}", .{});
-        try std.testing.expect(untagged_y.y);
+        const untagged_y = try parseFromSlice(Untagged, gpa, ".{.@\"y y\" = true}", .{});
+        try std.testing.expect(untagged_y.@"y y");
     }
 
     // Deep free
@@ -754,9 +758,9 @@ test "structs" {
 
     // Enum field and struct field with @
     {
-        const Vec0 = struct { x: enum { x } };
-        const parsed = try parseFromSlice(Vec0, gpa, ".{ .@\"x\" = .@\"x\" }", .{});
-        try std.testing.expectEqual(Vec0{ .x = .x }, parsed);
+        const Vec0 = struct { @"x x": enum { @"x x" } };
+        const parsed = try parseFromSlice(Vec0, gpa, ".{ .@\"x x\" = .@\"x x\" }", .{});
+        try std.testing.expectEqual(Vec0{ .@"x x" = .@"x x" }, parsed);
     }
 }
 
