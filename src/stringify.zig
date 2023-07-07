@@ -21,7 +21,13 @@ pub const Options = struct {
     pub fn unindent(self: *@This(), out_stream: anytype) @TypeOf(out_stream).Error!void {
         if (self.indent_level != null) {
             self.indent_level.? -= 1;
-            try out_stream.writeByte('\n');
+            try self.outputIndent(out_stream);
+        }
+    }
+
+    pub fn space(self: *@This(), out_stream: anytype) @TypeOf(out_stream).Error!void {
+        if (self.indent_level != null) {
+            try out_stream.writeByte(' ');
         }
     }
 };
@@ -71,10 +77,33 @@ pub fn stringify(value: anytype, options: Options, out_stream: anytype) !void {
                 try stringifyList(value, options, out_stream);
             }
         },
-        // .Struct => |Struct| if (Struct.is_tuple)
-        //     self.stringifyTuple(options, value, out_stream)
-        // else
-        //     self.stringifyStruct(options, value, out_stream),
+        .Struct => |strct| {
+            var child_options = options;
+            try out_stream.writeAll(".{");
+            if (strct.fields.len > 0) {
+                child_options.indent();
+                inline for (strct.fields, 0..) |field, i| {
+                    try child_options.outputIndent(out_stream);
+
+                    if (!strct.is_tuple) {
+                        try out_stream.writeByte('.');
+                        try out_stream.writeAll(field.name);
+
+                        try child_options.space(out_stream);
+                        try out_stream.writeByte('=');
+                        try child_options.space(out_stream);
+                    }
+
+                    try stringify(@field(value, field.name), child_options, out_stream);
+
+                    if (child_options.indent_level != null or i != strct.fields.len - 1) {
+                        try out_stream.writeByte(',');
+                    }
+                }
+                try child_options.unindent(out_stream);
+            }
+            try out_stream.writeAll("}");
+        },
         // .Union => self.stringifyUnion(options, value, out_stream),
 
         else => failToStringifyType(@TypeOf(value)),
@@ -82,6 +111,7 @@ pub fn stringify(value: anytype, options: Options, out_stream: anytype) !void {
 }
 
 fn stringifyList(value: anytype, options: Options, out_stream: anytype) !void {
+    // XXX: better to have a single copy?
     var child_options = options;
     try out_stream.writeAll(".{");
     if (value.len > 0) {
@@ -148,4 +178,40 @@ test "stringify basic" {
     // Slices of chars
     try expectStringifyEqual("abc", .{ .indent_level = null, .strings = false }, "&.{97,98,99}");
     try expectStringifyEqual("ab\"c", .{ .indent_level = null }, "\"ab\\\"c\"");
+
+    // Structs
+    try expectStringifyEqual(.{}, .{}, ".{}");
+    try expectStringifyEqual(.{}, .{ .indent_level = null }, ".{}");
+    try expectStringifyEqual(
+        .{ .x = @as(u8, 1), .y = @as(u8, 2), .z = .{ .c = @as(u8, 3) } },
+        .{ .indent_level = null },
+        ".{.x=1,.y=2,.z=.{.c=3}}",
+    );
+    try expectStringifyEqual(.{ .x = @as(u8, 1), .y = @as(u8, 2), .z = .{ .c = @as(u8, 3) } }, .{},
+        \\.{
+        \\    .x = 1,
+        \\    .y = 2,
+        \\    .z = .{
+        \\        .c = 3,
+        \\    },
+        \\}
+    );
+
+    // XXX: if a list or struct only has one line, don't make a newline?
+    // Tuples
+    const Tuple = struct { u8, u8, struct { u8 } };
+    try expectStringifyEqual(
+        Tuple{ @as(u8, 1), @as(u8, 2), .{@as(u8, 3)} },
+        .{ .indent_level = null },
+        ".{1,2,.{3}}",
+    );
+    try expectStringifyEqual(Tuple{ @as(u8, 1), @as(u8, 2), .{@as(u8, 3)} }, .{},
+        \\.{
+        \\    1,
+        \\    2,
+        \\    .{
+        \\        3,
+        \\    },
+        \\}
+    );
 }
