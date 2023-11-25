@@ -61,6 +61,9 @@ pub const Status = union(enum) {
         node: NodeIndex,
         expected: u8,
     },
+    type_expr: struct {
+        node: NodeIndex,
+    },
 };
 
 pub fn parseFromAst(comptime T: type, gpa: Allocator, ast: *const Ast, err: ?*Status, options: ParseOptions) Error!T {
@@ -550,8 +553,14 @@ fn elementsOrFields(
     node: NodeIndex,
 ) error{Type}![]const NodeIndex {
     if (self.ast.fullStructInit(buf, node)) |init| {
+        if (init.ast.type_expr != 0) {
+            return self.failTypeExpr(init.ast.type_expr);
+        }
         return init.ast.fields;
     } else if (self.ast.fullArrayInit(buf, node)) |init| {
+        if (init.ast.type_expr != 0) {
+            return self.failTypeExpr(init.ast.type_expr);
+        }
         return init.ast.elements;
     } else {
         return self.failExpectedType(T, node);
@@ -761,6 +770,107 @@ test "structs" {
         const Vec0 = struct { @"x x": enum { @"x x" } };
         const parsed = try parseFromSlice(Vec0, gpa, ".{ .@\"x x\" = .@\"x x\" }", .{});
         try std.testing.expectEqual(Vec0{ .@"x x" = .@"x x" }, parsed);
+    }
+
+    // Type expressions are not allowed
+    {
+        // Structs
+        {
+            const Empty = struct {};
+
+            var ast = try std.zig.Ast.parse(gpa, "Empty{}", .zon);
+            defer ast.deinit(gpa);
+
+            var status: Status = .success;
+            try std.testing.expectError(error.Type, parseFromAst(Empty, gpa, &ast, &status, .{}));
+            const node = status.type_expr.node;
+            const main_tokens = ast.nodes.items(.main_token);
+            const token = main_tokens[node];
+            const location = ast.tokenLocation(0, token);
+            try std.testing.expectEqual(Ast.Location{
+                .line = 0,
+                .column = 0,
+                .line_start = 0,
+                .line_end = 7,
+            }, location);
+        }
+
+        // Arrays
+        {
+            var ast = try std.zig.Ast.parse(gpa, "[3]u8{1, 2, 3}", .zon);
+            defer ast.deinit(gpa);
+
+            var status: Status = .success;
+            try std.testing.expectError(error.Type, parseFromAst([3]u8, gpa, &ast, &status, .{}));
+            const node = status.type_expr.node;
+            const main_tokens = ast.nodes.items(.main_token);
+            const token = main_tokens[node];
+            const location = ast.tokenLocation(0, token);
+            try std.testing.expectEqual(Ast.Location{
+                .line = 0,
+                .column = 0,
+                .line_start = 0,
+                .line_end = 14,
+            }, location);
+        }
+
+        // Slices
+        {
+            var ast = try std.zig.Ast.parse(gpa, "&[3]u8{1, 2, 3}", .zon);
+            defer ast.deinit(gpa);
+
+            var status: Status = .success;
+            try std.testing.expectError(error.Type, parseFromAst([]u8, gpa, &ast, &status, .{}));
+            const node = status.type_expr.node;
+            const main_tokens = ast.nodes.items(.main_token);
+            const token = main_tokens[node];
+            const location = ast.tokenLocation(0, token);
+            try std.testing.expectEqual(Ast.Location{
+                .line = 0,
+                .column = 1,
+                .line_start = 0,
+                .line_end = 15,
+            }, location);
+        }
+
+        // Tuples
+        {
+            const Tuple = struct { i32, i32, i32 };
+            var ast = try std.zig.Ast.parse(gpa, "Tuple{1, 2, 3}", .zon);
+            defer ast.deinit(gpa);
+
+            var status: Status = .success;
+            try std.testing.expectError(error.Type, parseFromAst(Tuple, gpa, &ast, &status, .{}));
+            const node = status.type_expr.node;
+            const main_tokens = ast.nodes.items(.main_token);
+            const token = main_tokens[node];
+            const location = ast.tokenLocation(0, token);
+            try std.testing.expectEqual(Ast.Location{
+                .line = 0,
+                .column = 0,
+                .line_start = 0,
+                .line_end = 14,
+            }, location);
+        }
+
+        // Functions
+        {
+            var ast = try std.zig.Ast.parse(gpa, "fn foo() {}", .zon);
+            defer ast.deinit(gpa);
+
+            var status: Status = .success;
+            try std.testing.expectError(error.Type, parseFromAst(struct {}, gpa, &ast, &status, .{}));
+            const node = status.type_expr.node;
+            const main_tokens = ast.nodes.items(.main_token);
+            const token = main_tokens[node];
+            const location = ast.tokenLocation(0, token);
+            try std.testing.expectEqual(Ast.Location{
+                .line = 0,
+                .column = 0,
+                .line_start = 0,
+                .line_end = 11,
+            }, location);
+        }
     }
 }
 
@@ -1488,7 +1598,7 @@ fn parseEnumTag(self: *Parser, comptime T: type, node: NodeIndex) error{Type}!T 
     const main_tokens = self.ast.nodes.items(.main_token);
     const data = self.ast.nodes.items(.data);
     const token = main_tokens[node];
-    var bytes = self.parseIdentifier(token);
+    const bytes = self.parseIdentifier(token);
     const dot_node = data[node].lhs;
     return tags.get(bytes) orelse
         self.failCannotRepresent(T, dot_node);
@@ -1803,6 +1913,13 @@ fn failFreeType(comptime T: type) noreturn {
     @compileError("Unable to free type '" ++ @typeName(T) ++ "'");
 }
 
+fn failTypeExpr(self: *Parser, node: NodeIndex) error{Type} {
+    @setCold(true);
+    return self.fail(.{ .type_expr = .{
+        .node = node,
+    } });
+}
+
 fn parseBool(self: *Parser, node: NodeIndex) error{Type}!bool {
     const tags = self.ast.nodes.items(.tag);
     const main_tokens = self.ast.nodes.items(.main_token);
@@ -1891,7 +2008,7 @@ fn parseNumberLiteral(self: *Parser, comptime T: type, node: NodeIndex) error{Ty
         .int => |int| return self.applySignToInt(T, node, int),
         .big_int => |base| return self.parseBigNumber(T, node, base),
         .float => return self.parseFloat(T, node),
-        else => unreachable,
+        .failure => unreachable,
     }
 }
 
