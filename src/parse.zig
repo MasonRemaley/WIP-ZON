@@ -210,6 +210,7 @@ test "void" {
         }, location);
     }
 
+    // XXX: will this fail properly comptime?
     // Brackets around values (will eventually be parser error)
     {
         var ast = try std.zig.Ast.parse(gpa, "{1}", .zon);
@@ -230,6 +231,7 @@ test "void" {
     }
 }
 
+// XXX: what's going on here?
 // TODO: see https://github.com/MasonRemaley/WIP-ZON/issues/3
 // test "null" {
 //     const gpa = std.testing.allocator;
@@ -2198,6 +2200,8 @@ test "parse int" {
     // Test characters
     try std.testing.expectEqual(@as(u8, 'a'), try parseFromSlice(u8, gpa, "'a'", .{}));
     try std.testing.expectEqual(@as(u8, 'z'), try parseFromSlice(u8, gpa, "'z'", .{}));
+    try std.testing.expectEqual(@as(i16, -'a'), try parseFromSlice(i16, gpa, "-'a'", .{}));
+    try std.testing.expectEqual(@as(i16, -'z'), try parseFromSlice(i16, gpa, "-'z'", .{}));
 
     // Test big integers
     try std.testing.expectEqual(
