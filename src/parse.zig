@@ -7,6 +7,7 @@ const Type = std.builtin.Type;
 const Base = std.zig.number_literal.Base;
 const FloatBase = std.zig.number_literal.FloatBase;
 const StringLiteralError = std.zig.string_literal.Error;
+const NumberLiteralError = std.zig.number_literal.Error;
 const assert = std.debug.assert;
 
 const Parser = @This();
@@ -34,10 +35,13 @@ pub const Status = union(enum) {
         name: []const u8,
         node: NodeIndex,
     },
-    // TODO: doesn't point to specific character right now
     invalid_string_literal: struct {
         node: NodeIndex,
         reason: StringLiteralError,
+    },
+    invalid_number_literal: struct {
+        node: NodeIndex,
+        reason: NumberLiteralError,
     },
     unknown_field: struct {
         node: NodeIndex,
@@ -1847,6 +1851,14 @@ fn failInvalidStringLiteral(self: *Parser, node: NodeIndex, reason: StringLitera
     } });
 }
 
+fn failInvalidNumberLiteral(self: *Parser, node: NodeIndex, reason: NumberLiteralError) error{Type} {
+    @setCold(true);
+    return self.fail(.{ .invalid_number_literal = .{
+        .node = node,
+        .reason = reason,
+    } });
+}
+
 fn failExpectedType(self: *Parser, comptime T: type, node: NodeIndex) error{Type} {
     @setCold(true);
     return self.fail(.{ .expected_type = .{
@@ -2010,7 +2022,7 @@ fn parseNumberLiteral(self: *Parser, comptime T: type, node: NodeIndex) error{Ty
         .int => |int| return self.applySignToInt(T, node, int),
         .big_int => |base| return self.parseBigNumber(T, node, base),
         .float => return self.parseFloat(T, node),
-        .failure => unreachable,
+        .failure => |reason| return self.failInvalidNumberLiteral(node, reason),
     }
 }
 
@@ -2325,7 +2337,29 @@ test "parse int" {
         .{},
     ));
 
-    // Failinig to parse as int
+    // Number with invalid character in the middle
+    {
+        var ast = try std.zig.Ast.parse(gpa, "32a32", .zon);
+        defer ast.deinit(gpa);
+        var status: Status = .success;
+        try std.testing.expectError(error.Type, parseFromAst(u8, gpa, &ast, &status, .{}));
+        try std.testing.expectEqual(status.invalid_number_literal.reason, .{ .invalid_digit = .{
+            .i = 2,
+            .base = @enumFromInt(10),
+        } });
+        const node = status.invalid_number_literal.node;
+        const main_tokens = ast.nodes.items(.main_token);
+        const token = main_tokens[node];
+        const location = ast.tokenLocation(0, token);
+        try std.testing.expectEqual(Ast.Location{
+            .line = 0,
+            .column = 0,
+            .line_start = 0,
+            .line_end = 5,
+        }, location);
+    }
+
+    // Failing to parse as int
     {
         var ast = try std.zig.Ast.parse(gpa, "true", .zon);
         defer ast.deinit(gpa);
